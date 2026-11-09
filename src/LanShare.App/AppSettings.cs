@@ -17,6 +17,7 @@ internal sealed class AppSettings
     public bool AutoAccept { get; set; } = true;
     public bool LaunchAtLogin { get; set; } = true;
     public int ScreenshotShortcut { get; set; } = (int)ScreenshotHotkey.DefaultShortcut;
+    public int RecordingShortcut { get; set; } = (int)(Keys.Control | Keys.Alt | Keys.R);
     private static readonly string FilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SimpleLanShare", "settings.json");
 
     // 损坏或旧版本配置不会阻止启动。

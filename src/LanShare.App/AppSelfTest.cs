@@ -35,6 +35,7 @@ internal static class AppSelfTest
         lines.Add("PASS: oversized PNG rejected before GDI+ decode");
         using var form = new MainForm(true);
         form.SavePreview(Path.ChangeExtension(report, ".png"));
+        for (int page = 1; page < 5; page++) form.SavePreview(Path.Combine(Path.GetDirectoryName(report)!, $"page-{page}.png"), page);
         form.Close(); Application.DoEvents();
         if (form.IsDisposed || form.Visible) throw new Exception("Close must hide to tray without disposal");
         lines.Add("PASS: window close keeps application alive in tray");
@@ -44,6 +45,7 @@ internal static class AppSelfTest
         lines.Add("PASS: WinForms layout and clipboard listener initialization");
         lines.AddRange(DesktopFeatureTests.Run(Path.GetDirectoryName(Path.GetFullPath(report))!));
         lines.AddRange(ScreenRecordingTests.Run(Path.GetDirectoryName(Path.GetFullPath(report))!));
+        lines.AddRange(RecordingInteractionTests.Run(Path.GetDirectoryName(Path.GetFullPath(report))!));
         File.WriteAllLines(report, lines);
     }
 }

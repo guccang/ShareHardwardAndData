@@ -7,12 +7,13 @@ using System.Security.Cryptography.X509Certificates;
 namespace LanShare.App;
 
 // 原生 Windows 桌面界面：设备配对、文件投递区和接收列表集中在同一窗口。
-internal sealed class MainForm : Form
+internal sealed partial class MainForm : Form
 {
     private readonly AppSettings settings;
     private readonly ClipboardBridge clipboard;
     private readonly X509Certificate2 identity;
     private readonly ScreenshotHotkey screenshotHotkey;
+    private readonly ScreenshotHotkey recordingHotkey;
     private readonly ScreenshotController screenshots;
     private readonly ScreenRecordingController recording = new();
     private readonly Button recordButton = MakeButton("区域录屏", width: 115);
@@ -52,7 +53,7 @@ internal sealed class MainForm : Form
         folder.Text = settings.ReceiveFolder;
         sync.Checked = settings.ClipboardEnabled; accept.Checked = settings.AutoAccept;
         AutoScaleDimensions = new SizeF(96, 96); AutoScaleMode = AutoScaleMode.Dpi;
-        Text = baseTitle; ClientSize = new Size(1000, 828); MinimumSize = new Size(940, 808);
+        Text = baseTitle; ClientSize = new Size(1040, 720); MinimumSize = new Size(940, 660);
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Microsoft YaHei UI", 9F);
         BackColor = Color.FromArgb(242, 246, 249);
@@ -60,6 +61,8 @@ internal sealed class MainForm : Form
         Icon = appIcon; tray.Icon = appIcon;
         screenshots = new ScreenshotController(appIcon);
         screenshotHotkey = new ScreenshotHotkey((Keys)settings.ScreenshotShortcut, !smoke);
+        recordingHotkey = new ScreenshotHotkey((Keys)settings.RecordingShortcut, !smoke, "录屏", Keys.Control | Keys.Alt | Keys.R);
+        recording.ShortcutLabel = recordingHotkey.Label;
         startup.Checked = settings.LaunchAtLogin;
         BuildLayout();
         clipboard = new ClipboardBridge();
@@ -69,12 +72,13 @@ internal sealed class MainForm : Form
         captureButton.Click += async (_, _) => await CaptureScreenshotAsync();
         screenshotHotkey.Pressed += async () => await CaptureScreenshotAsync();
         recordButton.Click += async (_, _) => await ToggleRecordingAsync();
+        recordingHotkey.Pressed += async () => await ToggleRecordingAsync();
         recording.Changed += RefreshRecordingState;
-        recording.Notice += text => { Log("录屏", text); if (!shuttingDown) tray.ShowBalloonTip(4000, "区域录屏", text, text.Contains("失败") ? ToolTipIcon.Warning : ToolTipIcon.Info); };
+        recording.Notice += text => { Log("录屏", text); recordingMessage.Text = text; if (!shuttingDown && !recording.IsRecording) tray.ShowBalloonTip(4000, "区域录屏", text, text.Contains("失败") ? ToolTipIcon.Warning : ToolTipIcon.Info); };
         recordingTimer.Tick += (_, _) => RefreshRecordingState();
         Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
         Microsoft.Win32.SystemEvents.DisplaySettingsChanging += OnDisplaySettingsChanging;
-        screenshots.Notice += text => { Log("截图", text); if (!Visible && (text.Contains("失败") || text.Contains("占用"))) tray.ShowBalloonTip(3000, "截图", text, ToolTipIcon.Warning); };
+        screenshots.Notice += text => { Log("截图", text); screenshotMessage.Text = text; if (!Visible && (text.Contains("失败") || text.Contains("占用"))) tray.ShowBalloonTip(3000, "截图", text, ToolTipIcon.Warning); };
         start.Click += (_, _) => ToggleSharing();
         browse.Click += (_, _) => ChooseFolder();
         manual.Click += async (_, _) => await ConnectManuallyAsync();
@@ -88,6 +92,7 @@ internal sealed class MainForm : Form
         var lastItem = trayMenu.Items.Add("查看 / 保存上次截图", null, (_, _) => screenshots.ShowLast());
         trayMenu.Items.Add("截图快捷键…", null, (_, _) => ConfigureScreenshot());
         var recordItem = trayMenu.Items.Add("区域录屏…", null, async (_, _) => await ToggleRecordingAsync());
+        trayMenu.Items.Add("录屏快捷键…", null, (_, _) => ConfigureRecording());
         var videoItem = trayMenu.Items.Add("打开上次录屏位置", null, (_, _) => recording.ShowLast());
         trayMenu.Items.Add(new ToolStripSeparator());
         var startupItem = new ToolStripMenuItem("开机自启动") { CheckOnClick = true };
@@ -96,8 +101,8 @@ internal sealed class MainForm : Form
         trayMenu.Opening += (_, _) =>
         {
             captureItem.Text = "截图 (" + screenshotHotkey.Label + ")"; captureItem.Enabled = !screenshots.IsCapturing && !recording.IsBusy;
-            recordItem.Text = recording.IsStopping ? "正在保存录屏…" : recording.IsRecording ? "停止录屏并保存" : "区域录屏…";
-            recordItem.Enabled = !shuttingDown && !screenshots.IsCapturing && !shortcutSettingsOpen && !recording.IsStopping && (!recording.IsBusy || recording.IsRecording);
+            recordItem.Text = recording.IsStopping ? "正在保存录屏…" : recording.IsBusy ? "停止录屏并保存" : "区域录屏 (" + recordingHotkey.Label + ")";
+            recordItem.Enabled = !shuttingDown && !screenshots.IsCapturing && !shortcutSettingsOpen && !recording.IsStopping;
             videoItem.Enabled = recording.LastVideo is not null;
             lastItem.Enabled = screenshots.HasImage; updatingStartup = true; startupItem.Checked = startup.Checked; updatingStartup = false;
         };
@@ -106,7 +111,7 @@ internal sealed class MainForm : Form
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized && !smoke) Hide(); };
         RefreshPeers();
         UpdateState("自动发现 · 首次连接需要双方确认", "各台电脑打开软件即可；确认过的设备下次自动连接，无需共享码。");
-        captureButton.Text = "截图 " + screenshotHotkey.Label;
+        RefreshShortcutLabels();
         Shown += (_, _) => InitializeRuntime();
     }
 
@@ -132,6 +137,7 @@ internal sealed class MainForm : Form
         try { StartupRegistration.SetEnabled(settings.LaunchAtLogin, StartupRegistration.CurrentCommand()); settings.Save(); }
         catch (Exception ex) { Log("自启动设置失败", ex.Message); tray.ShowBalloonTip(3000, "自启动设置失败", "可打开窗口重新设置：" + ex.Message, ToolTipIcon.Warning); }
         ToggleSharing();
+        if (recordingHotkey.Error is not null) { Log("录屏快捷键", recordingHotkey.Error); recordingMessage.Text = recordingHotkey.Error; tray.ShowBalloonTip(3000, "录屏快捷键未注册", recordingHotkey.Error, ToolTipIcon.Warning); }
         if (screenshotHotkey.Error is not null) { Log("截图快捷键", screenshotHotkey.Error); tray.ShowBalloonTip(3000, "截图快捷键未注册", screenshotHotkey.Error, ToolTipIcon.Warning); }
         else if (!Visible) tray.ShowBalloonTip(2000, "局域共享已在后台运行", screenshotHotkey.Label + " 截图；双击托盘图标打开窗口。", ToolTipIcon.Info);
     }
@@ -176,8 +182,25 @@ internal sealed class MainForm : Form
             {
                 int previous = settings.ScreenshotShortcut; settings.ScreenshotShortcut = (int)value;
                 try { settings.Save(); } catch { settings.ScreenshotShortcut = previous; throw; }
-            }, appIcon);
-            dialog.ShowDialog(); captureButton.Text = "截图 " + screenshotHotkey.Label;
+            }, appIcon, "截图", value => value == recordingHotkey.Shortcut ? "截图和录屏必须使用不同的快捷键。" : null);
+            dialog.ShowDialog(); RefreshShortcutLabels();
+        }
+        finally { shortcutSettingsOpen = false; }
+    }
+
+    // 录屏快捷键单独持久保存，同时防止与本软件截图快捷键重复。
+    private void ConfigureRecording()
+    {
+        if (screenshots.IsCapturing || shortcutSettingsOpen || recording.IsBusy) return;
+        shortcutSettingsOpen = true;
+        try
+        {
+            using var dialog = new ScreenshotSettingsDialog(recordingHotkey, value =>
+            {
+                int previous = settings.RecordingShortcut; settings.RecordingShortcut = (int)value;
+                try { settings.Save(); } catch { settings.RecordingShortcut = previous; throw; }
+            }, appIcon, "录屏", value => value == screenshotHotkey.Shortcut ? "录屏和截图必须使用不同的快捷键。" : null);
+            dialog.ShowDialog(); recording.ShortcutLabel = recordingHotkey.Label; RefreshShortcutLabels();
         }
         finally { shortcutSettingsOpen = false; }
     }
@@ -186,8 +209,7 @@ internal sealed class MainForm : Form
     private async Task ToggleRecordingAsync()
     {
         if (shuttingDown || screenshots.IsCapturing || shortcutSettingsOpen || recording.IsStopping) return;
-        if (recording.IsRecording) { await recording.StopAsync(); return; }
-        if (recording.IsBusy) return;
+        if (recording.IsBusy) { await recording.StopAsync(); return; }
         bool restore = Visible;
         if (restore) Hide();
         try { await recording.StartAsync(); }
@@ -198,9 +220,11 @@ internal sealed class MainForm : Form
     private void RefreshRecordingState()
     {
         if (IsDisposed) return;
-        recordButton.Text = recording.IsStopping ? "正在保存…" : recording.IsRecording ? "停止录屏" : "区域录屏";
-        recordButton.Enabled = !shuttingDown && !recording.IsStopping && (!recording.IsBusy || recording.IsRecording);
+        recordButton.Text = recording.IsStopping ? "正在保存…" : recording.IsBusy ? "停止并保存" : "开始录屏";
+        recordButton.Enabled = !shuttingDown && !recording.IsStopping;
         captureButton.Enabled = !recording.IsBusy;
+        recording.UpdateOverlay();
+        recordingClock.Text = recording.IsStopping ? "正在保存" : recording.IsBusy && !recording.IsRecording ? "准备录制" : recording.Elapsed.ToString(@"hh\:mm\:ss");
         tray.Icon = recording.IsBusy ? SystemIcons.Warning : appIcon;
         if (recording.IsBusy)
         {
@@ -225,89 +249,10 @@ internal sealed class MainForm : Form
         await recording.StopAsync(exiting: true);
         ExitApplication();
     }
-    // 使用标准布局容器适应窗口缩放和系统 DPI。
-    private void BuildLayout()
-    {
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24, 16, 24, 18), ColumnCount = 1, RowCount = 6 };
-        foreach (int height in new[] { 72, 166, 83, 126, 65 }) root.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        Controls.Add(root);
-        var title = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
-        title.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-        title.Controls.Add(new Label { Text = "局域共享", AutoSize = true, Font = new Font(Font.FontFamily, 22, FontStyle.Bold), ForeColor = Color.FromArgb(17, 83, 83) });
-        title.Controls.Add(new Label { Text = "自己的电脑，数据随手可达。  /  剪贴板同步 · 文件拖拽互传", AutoSize = true, ForeColor = Color.FromArgb(91, 110, 127), Margin = new Padding(2, 6, 0, 0) });
-        root.Controls.Add(title, 0, 0);
-
-        var settingsPanel = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Padding = new Padding(12), ColumnCount = 4, RowCount = 4 };
-        settingsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 80));
-        settingsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        settingsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
-        settingsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
-        for (int i = 0; i < 4; i++) settingsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        settingsPanel.Controls.Add(Caption("本机设备"), 0, 0);
-        settingsPanel.Controls.Add(new Label { Text = Environment.MachineName + "  ·  自动发现附近电脑", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 1, 0);
-        var pairingTools = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
-        var retry = MakeButton("重新配对", width: 82); var forget = MakeButton("清除信任", width: 82);
-        retry.Click += (_, _) => { if (network is null) ToggleSharing(); else network.RetryPairing(); Log("配对", "已允许重新发起连接确认"); };
-        forget.Click += (_, _) => ForgetDevices();
-        pairingTools.Controls.AddRange([retry, forget]); settingsPanel.Controls.Add(pairingTools, 2, 0);        settingsPanel.Controls.Add(start, 3, 0);
-        settingsPanel.Controls.Add(Caption("接收目录"), 0, 1); settingsPanel.Controls.Add(folder, 1, 1);
-        var folderTools = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
-        folderTools.Controls.Add(browse); var open = MakeButton("打开", width: 58); open.Click += (_, _) => OpenFolder(); folderTools.Controls.Add(open);
-        settingsPanel.Controls.Add(folderTools, 2, 1); settingsPanel.SetColumnSpan(folderTools, 2);
-        var options = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
-        sync.Margin = new Padding(3, 7, 18, 0); accept.Margin = new Padding(3, 7, 18, 0);
-        var shareNow = MakeButton("同步当前剪贴板", width: 145); shareNow.Click += (_, _) => clipboard.ShareNow();
-        options.Controls.AddRange([sync, accept, shareNow]); settingsPanel.Controls.Add(options, 1, 2); settingsPanel.SetColumnSpan(options, 3);
-        var utilities = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
-        startup.Margin = new Padding(3, 7, 18, 0);
-        var lastScreenshot = MakeButton("查看 / 保存截图", width: 145); lastScreenshot.Click += (_, _) => screenshots.ShowLast();
-        var shortcut = MakeButton("截图快捷键", width: 100); shortcut.Click += (_, _) => ConfigureScreenshot();
-        var lastVideo = MakeButton("录屏文件", width: 90); lastVideo.Click += (_, _) => recording.ShowLast();
-        utilities.Controls.AddRange([startup, captureButton, lastScreenshot, shortcut, recordButton, lastVideo]);
-        settingsPanel.Controls.Add(utilities, 0, 3); settingsPanel.SetColumnSpan(utilities, 4);
-        root.Controls.Add(settingsPanel, 0, 1);
-
-        var peers = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(0, 10, 0, 0) };
-        peers.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        var peerLine = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
-        peerLine.Controls.Add(Caption("文件发给")); peerLine.Controls.Add(targets);
-        peerLine.Controls.Add(new Label { Text = "自动发现失败时：", AutoSize = true, Margin = new Padding(22, 6, 3, 0) });
-        peerLine.Controls.Add(host); peerLine.Controls.Add(manual);
-        peers.Controls.Add(peerLine);
-        peers.Controls.Add(new Label { Text = "本机 IP：" + LocalAddresses() + "    |    TCP 42656 · UDP 42657", AutoSize = true, ForeColor = Color.FromArgb(91, 110, 127), Margin = new Padding(4, 5, 0, 0) });
-        root.Controls.Add(peers, 0, 2);
-
-        var drop = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(227, 242, 239), Padding = new Padding(12), Margin = new Padding(3, 3, 3, 6) };
-        var dropText = new Label
-        {
-            Text = "＋  把文件拖到这里\n\n或点击选择文件 · 支持多选 · 发送给上方选中的电脑",
-            Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter,
-            Font = new Font(Font.FontFamily, 11), ForeColor = Color.FromArgb(17, 83, 83), AllowDrop = true, Cursor = Cursors.Hand
-        };
-        dropText.DragEnter += (_, e) => e.Effect = network is not null && e.Data?.GetDataPresent(DataFormats.FileDrop) == true ? DragDropEffects.Copy : DragDropEffects.None;
-        dropText.DragDrop += async (_, e) => { if (e.Data?.GetData(DataFormats.FileDrop) is string[] paths) await QueueFilesAsync(paths); };
-        dropText.Click += async (_, _) =>
-        {
-            using var dialog = new OpenFileDialog { Multiselect = true, Title = "选择要发送的文件" };
-            if (dialog.ShowDialog(this) == DialogResult.OK) await QueueFilesAsync(dialog.FileNames);
-        };
-        drop.Controls.Add(dropText); root.Controls.Add(drop, 0, 3);
-        var status = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
-        status.RowStyles.Add(new RowStyle(SizeType.Absolute, 30)); state.Font = new Font(Font, FontStyle.Bold);
-        status.Controls.Add(state); status.Controls.Add(detail); root.Controls.Add(status, 0, 4);
-
-        var tabs = new TabControl { Dock = DockStyle.Fill };
-        var transfers = new TabPage("活动与传输"); var downloads = new TabPage("已接收文件（可拖出）");
-        history.Columns.Add("时间", 85); history.Columns.Add("方向 / 设备", 190); history.Columns.Add("内容 / 进度", 620);
-        received.Columns.Add("文件名", 320); received.Columns.Add("来自", 160); received.Columns.Add("保存位置", 420);
-        transfers.Controls.Add(history); downloads.Controls.Add(received); tabs.TabPages.AddRange([transfers, downloads]); root.Controls.Add(tabs, 0, 5);
-    }
-
     // 按钮保留系统焦点与键盘操作语义，主按钮使用统一强调色。
     private static Button MakeButton(string text, bool primary = false, int width = 100) => new()
     {
-        Text = text, Width = width, Height = 28, FlatStyle = FlatStyle.Flat,
+        Text = text, Width = width, Height = 34, FlatStyle = FlatStyle.Flat,
         BackColor = primary ? Color.FromArgb(17, 112, 103) : Color.White,
         ForeColor = primary ? Color.White : Color.FromArgb(28, 47, 65), Margin = new Padding(3, 1, 3, 1), Cursor = Cursors.Hand
     };
@@ -622,7 +567,7 @@ internal sealed class MainForm : Form
         Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
         Microsoft.Win32.SystemEvents.DisplaySettingsChanging -= OnDisplaySettingsChanging;
         recordingTimer.Dispose(); recording.Dispose();
-        screenshotHotkey.Dispose(); screenshots.Dispose(); StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
+        screenshotHotkey.Dispose(); recordingHotkey.Dispose(); screenshots.Dispose(); StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
         base.OnFormClosing(e);
     }
 
@@ -637,8 +582,9 @@ internal sealed class MainForm : Form
         return (Icon)icon.Clone();
     }
     // 无需启动网络或修改剪贴板即可生成界面快照，用于本地视觉验证。
-    internal void SavePreview(string path)
+    internal void SavePreview(string path, int pageIndex = 0)
     {
+        SelectPage(pageIndex);
         Opacity = 0; ShowInTaskbar = false; Show(); PerformLayout(); Application.DoEvents();
         using var bitmap = new Bitmap(Width, Height);
         DrawToBitmap(bitmap, new Rectangle(Point.Empty, Size)); bitmap.Save(path);

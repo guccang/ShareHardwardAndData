@@ -2,12 +2,13 @@ using System.Runtime.InteropServices;
 
 namespace LanShare.App;
 
-// 全局截图快捷键独立于共享连接，断网或停止共享后仍可在本机截图。
+// 截图和录屏各持有独立的全局快捷键窗口，断网或停止共享后仍可使用。
 internal sealed class ScreenshotHotkey : NativeWindow, IDisposable
 {
     internal const Keys DefaultShortcut = Keys.Control | Keys.Alt | Keys.A;
     private int activeId;
     private bool disposed;
+    private readonly string actionName;
     public Keys Shortcut { get; private set; }
     public bool Registered => activeId != 0;
     public string? Error { get; private set; }
@@ -15,10 +16,11 @@ internal sealed class ScreenshotHotkey : NativeWindow, IDisposable
     public event Action? Pressed;
 
     // 隐藏消息窗口接收 WM_HOTKEY，测试和预览模式可跳过真实注册。
-    public ScreenshotHotkey(Keys shortcut, bool register = true)
+    public ScreenshotHotkey(Keys shortcut, bool register = true, string actionName = "截图", Keys fallback = DefaultShortcut)
     {
-        CreateHandle(new CreateParams { Caption = "SimpleLanShare.Screenshot", Parent = new IntPtr(-3) });
-        Shortcut = IsValid(shortcut) ? shortcut : DefaultShortcut;
+        this.actionName = actionName;
+        CreateHandle(new CreateParams { Caption = "SimpleLanShare.Hotkey." + actionName, Parent = new IntPtr(-3) });
+        Shortcut = IsValid(shortcut) ? shortcut : fallback;
         if (register) Error = Apply(Shortcut);
     }
 
@@ -45,16 +47,16 @@ internal sealed class ScreenshotHotkey : NativeWindow, IDisposable
     // 先注册并保存新快捷键，再释放旧键；冲突或保存失败时旧快捷键继续有效。
     public string? Apply(Keys value, Action<Keys>? persist = null)
     {
-        if (disposed) return "截图快捷键已关闭。";
+        if (disposed) return actionName + "快捷键已关闭。";
         if (!IsValid(value)) return "请选择 Ctrl / Alt / Shift 中至少一个修饰键，以及一个字母、数字或功能键。";
-        if (Registered && value == Shortcut) return null;
+        if (Registered && value == Shortcut) { Error = null; return null; }
         int next = activeId == 1 ? 2 : 1;
         uint modifiers = 0x4000;
         if ((value & Keys.Alt) != 0) modifiers |= 1;
         if ((value & Keys.Control) != 0) modifiers |= 2;
         if ((value & Keys.Shift) != 0) modifiers |= 4;
         if (!RegisterHotKey(Handle, next, modifiers, (uint)(value & Keys.KeyCode)))
-            return Error = "快捷键已被占用，请更换组合；仍可从托盘菜单截图。";
+            return Error = "快捷键已被占用，请更换组合；仍可从托盘菜单" + actionName + "。";
         try { persist?.Invoke(value); }
         catch (Exception ex) { UnregisterHotKey(Handle, next); return "无法保存快捷键：" + ex.Message; }
         if (Registered) UnregisterHotKey(Handle, activeId);
@@ -62,7 +64,7 @@ internal sealed class ScreenshotHotkey : NativeWindow, IDisposable
         return null;
     }
 
-    // 系统消息只触发本机截图，不进入远程键鼠通道。
+    // 系统消息只触发对应的本机操作，不进入远程键鼠通道。
     protected override void WndProc(ref System.Windows.Forms.Message message)
     {
         if (message.Msg == 0x0312 && message.WParam.ToInt32() == activeId && Registered) Pressed?.Invoke();

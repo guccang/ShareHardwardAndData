@@ -33,7 +33,7 @@ internal sealed class ScreenRecordingSession : IDisposable
         return new Size(Math.Max(2, (int)(source.Width * ratio) & ~1), Math.Max(2, (int)(source.Height * ratio) & ~1));
     }
 
-    // 仅在成功封装 MP4 后替换目标文件，失败不会覆盖已有视频。
+    // 仅在成功封装 MP4 后公布目标文件；自动命名也不允许覆盖任何已有视频。
     private RecordingResult Record(Rectangle region, Action<Bitmap>? capture)
     {
         string directory = Path.GetDirectoryName(OutputPath)!;
@@ -77,8 +77,8 @@ internal sealed class ScreenRecordingSession : IDisposable
                 if (frames == 0) throw new OperationCanceledException(stop.Token);
                 writer.Complete(); finalized = true;
             }
-            // 完成后释放文件句柄，再公布最终文件名；目标覆盖已经由保存对话框确认。
-            File.Move(temporary, OutputPath, true);
+            // 完成后释放文件句柄，再公布最终文件名，极端重名也保留两个文件。
+            File.Move(temporary, OutputPath, false);
             return new RecordingResult(OutputPath, TimeSpan.FromTicks(lastTimestamp + MediaFoundationVideoWriter.FrameDuration), warning);
         }
         catch (Exception ex)

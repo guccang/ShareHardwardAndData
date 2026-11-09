@@ -29,7 +29,7 @@ internal static class ScreenRecordingTests
         using (var exclusive = File.Open(sample, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
             Assert(exclusive.Length > 1000, "encoder releases output handle after finalization", results);
 
-        string stoppedPath = Path.Combine(directory, "stopped-recording.mp4");
+        string stoppedPath = ScreenRecordingController.CreateOutputPath(directory);
         using (var session = new ScreenRecordingSession(new Rectangle(-40, -30, 160, 96), stoppedPath, frame => PaintFrame(frame, 0)))
         {
             session.Ready.WaitAsync(TimeSpan.FromSeconds(30)).GetAwaiter().GetResult();
@@ -39,7 +39,7 @@ internal static class ScreenRecordingTests
             var result = session.Completion.WaitAsync(TimeSpan.FromSeconds(30)).GetAwaiter().GetResult();
             Assert(result.Path == stoppedPath && result.Duration > TimeSpan.Zero && HasFinalizedMp4(stoppedPath), "stop completes recording without UI thread or desktop capture", results);
         }
-        string interruptedPath = Path.Combine(directory, "interrupted-recording.mp4");
+        string interruptedPath = ScreenRecordingController.CreateOutputPath(directory);
         int captures = 0;
         using (var session = new ScreenRecordingSession(new Rectangle(0, 0, 160, 96), interruptedPath, frame =>
         {

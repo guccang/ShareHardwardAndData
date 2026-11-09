@@ -9,6 +9,8 @@ internal sealed class ScreenRecordingController : IDisposable
     private readonly CancellationTokenSource lifetime = new();
     private ScreenshotSelection? selection;
     private ScreenRecordingSession? session;
+    private RecordingOverlay? overlay;
+    private CancellationTokenSource? runStop;
     private Task? running;
     private bool disposed;
     private readonly Stopwatch elapsed = new();
@@ -17,6 +19,8 @@ internal sealed class ScreenRecordingController : IDisposable
     public bool IsStopping { get; private set; }
     public string? LastVideo { get; private set; }
     public TimeSpan Elapsed => elapsed.Elapsed;
+    public string ShortcutLabel { get; set; } = "Ctrl+Alt+R";
+    public static string SaveDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "SimpleLanShare");
     public event Action? Changed;
     public event Action<string>? Notice;
 
@@ -24,16 +28,18 @@ internal sealed class ScreenRecordingController : IDisposable
     public Task StartAsync()
     {
         if (disposed || IsBusy) return Task.CompletedTask;
-        IsBusy = true; IsStopping = false; Changed?.Invoke();
+        runStop = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        elapsed.Reset(); IsBusy = true; IsStopping = false; Changed?.Invoke();
         running = RunAsync(); return running;
     }
 
-    // 框选后由用户选择输出位置，取消任一步都不会改动剪贴板或创建视频。
+    // 框选后直接展示边框和停止条，自动命名保存，不弹出文件对话框。
     private async Task RunAsync()
     {
         try
         {
-            await Task.Delay(200, lifetime.Token);
+            CancellationToken token = runStop!.Token;
+            await Task.Delay(200, token);
             Rectangle desktopBounds = SystemInformation.VirtualScreen;
             ScreenshotGeometry.ValidateDesktop(desktopBounds);
             Rectangle region;
@@ -41,28 +47,22 @@ internal sealed class ScreenRecordingController : IDisposable
             {
                 using (var graphics = Graphics.FromImage(desktop))
                     graphics.CopyFromScreen(desktopBounds.Location, Point.Empty, desktopBounds.Size, CopyPixelOperation.SourceCopy);
-                using var overlay = new ScreenshotSelection(desktop, desktopBounds, "拖动选择录屏区域 · Esc / 右键取消");
-                selection = overlay;
-                if (overlay.ShowDialog() != DialogResult.OK) return;
+                using var picker = new ScreenshotSelection(desktop, desktopBounds, "拖动框选，松开后开始录屏 · Esc / 右键取消");
+                selection = picker;
+                if (picker.ShowDialog() != DialogResult.OK) return;
                 selection = null;
-                region = new Rectangle(desktopBounds.X + overlay.Selected.X, desktopBounds.Y + overlay.Selected.Y, overlay.Selected.Width, overlay.Selected.Height);
+                region = new Rectangle(desktopBounds.X + picker.Selected.X, desktopBounds.Y + picker.Selected.Y, picker.Selected.Width, picker.Selected.Height);
             }
-            lifetime.Token.ThrowIfCancellationRequested();
+            token.ThrowIfCancellationRequested();
             Size output = ScreenRecordingSession.FitVideoSize(region.Size);
-            using var save = new SaveFileDialog
-            {
-                Title = $"保存录屏 · 无声 MP4 · {output.Width}×{output.Height}", Filter = "MP4 视频|*.mp4",
-                DefaultExt = "mp4", AddExtension = true, OverwritePrompt = true,
-                InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),
-                FileName = "录屏_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + ".mp4"
-            };
-            if (save.ShowDialog() != DialogResult.OK) return;
-            await Task.Delay(300, lifetime.Token);
-            session = new ScreenRecordingSession(region, save.FileName);
+            overlay = new RecordingOverlay(region, ShortcutLabel, () => _ = StopAsync());
+            overlay.ShowControls();
+            await Task.Delay(200, token);
+            session = new ScreenRecordingSession(region, CreateOutputPath(SaveDirectory));
             try { await session.Ready; }
             catch { await session.Completion; throw; }
-            IsRecording = true; elapsed.Restart(); Changed?.Invoke();
-            Notice?.Invoke($"正在录屏：{output.Width}×{output.Height}，无声 MP4；从托盘选择“停止录屏并保存”结束。");
+            IsRecording = true; elapsed.Restart(); Changed?.Invoke(); UpdateOverlay();
+            Notice?.Invoke($"正在录屏：{output.Width}×{output.Height}；点击选区旁的停止按钮或按 {ShortcutLabel}，自动保存 MP4。");
             RecordingResult result = await session.Completion;
             LastVideo = result.Path;
             Notice?.Invoke(result.Warning is null ? "录屏已保存：" + result.Path : result.Warning + "\n" + result.Path);
@@ -74,7 +74,8 @@ internal sealed class ScreenRecordingController : IDisposable
         }
         finally
         {
-            selection = null; session?.Dispose(); session = null; elapsed.Stop();
+            selection = null; overlay?.Dispose(); overlay = null; session?.Dispose(); session = null; elapsed.Stop();
+            runStop?.Dispose(); runStop = null;
             IsRecording = IsBusy = IsStopping = false; Changed?.Invoke();
         }
     }
@@ -85,8 +86,23 @@ internal sealed class ScreenRecordingController : IDisposable
         if (exiting) lifetime.Cancel();
         if (!IsBusy) return;
         IsStopping = true; Changed?.Invoke();
+        UpdateOverlay(); runStop?.Cancel();
         selection?.Close(); session?.RequestStop();
         if (running is not null) await running;
+    }
+
+    // 时间戳便于查找，随机后缀避免同一毫秒多次录制重名；实际保存仍拒绝覆盖。
+    internal static string CreateOutputPath(string directory) => Path.Combine(Path.GetFullPath(directory),
+        "录屏_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + "_" + Guid.NewGuid().ToString("N")[..6] + ".mp4");
+
+    // 主窗体计时器负责刷新浮层，隐藏主窗体时也持续更新。
+    public void UpdateOverlay() => overlay?.UpdateStatus(Elapsed, IsRecording, IsStopping);
+
+    // 固定保存目录可随时打开，首次使用时自动建立。
+    public void OpenSaveDirectory()
+    {
+        try { Directory.CreateDirectory(SaveDirectory); Process.Start(new ProcessStartInfo(SaveDirectory) { UseShellExecute = true }); }
+        catch (Exception ex) { Notice?.Invoke("打开录屏目录失败：" + ex.Message); }
     }
 
     // 在资源管理器定位结果，用户可继续通过现有文件投递区域发送视频。
@@ -101,7 +117,7 @@ internal sealed class ScreenRecordingController : IDisposable
     public void Dispose()
     {
         if (disposed) return;
-        disposed = true; lifetime.Cancel(); selection?.Close(); session?.RequestStop();
+        disposed = true; lifetime.Cancel(); selection?.Close(); overlay?.Dispose(); overlay = null; session?.RequestStop();
         if (!IsBusy) lifetime.Dispose();
     }
 }

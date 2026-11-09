@@ -1,16 +1,16 @@
 namespace LanShare.App;
 
-// 截图设置窗口在原有配对、共享之外独立配置快捷键。
+// 通用快捷键设置窗口分别配置截图与录屏，不与配对和共享设置混在一起。
 internal sealed class ScreenshotSettingsDialog : Form
 {
     // 控件明确选择修饰键和主键；失败时保留窗口和原先的可用组合。
-    public ScreenshotSettingsDialog(ScreenshotHotkey hotkey, Action<Keys> persist, Icon icon)
+    public ScreenshotSettingsDialog(ScreenshotHotkey hotkey, Action<Keys> persist, Icon icon, string actionName = "截图", Func<Keys, string?>? validate = null)
     {
-        Icon = icon; Text = "截图快捷键"; ClientSize = new Size(470, 185);
+        Icon = icon; Text = actionName + "快捷键"; ClientSize = new Size(470, 185);
         AutoScaleMode = AutoScaleMode.Dpi; AutoScaleDimensions = new SizeF(96, 96);
         StartPosition = FormStartPosition.CenterParent; FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false; Font = new Font("Microsoft YaHei UI", 9);
-        var hint = new Label { Text = "设置全局截图快捷键（后台也可用）", AutoSize = true, Location = new Point(16, 16) };
+        var hint = new Label { Text = "设置全局" + actionName + "快捷键（后台也可用）", AutoSize = true, Location = new Point(16, 16) };
         var row = new FlowLayoutPanel { Location = new Point(16, 48), Size = new Size(440, 38) };
         var ctrl = new CheckBox { Text = "Ctrl", Checked = hotkey.Shortcut.HasFlag(Keys.Control), AutoSize = true };
         var alt = new CheckBox { Text = "Alt", Checked = hotkey.Shortcut.HasFlag(Keys.Alt), AutoSize = true };
@@ -27,7 +27,7 @@ internal sealed class ScreenshotSettingsDialog : Form
         {
             if (key.SelectedItem is not Keys mainKey) return;
             Keys value = mainKey | (ctrl.Checked ? Keys.Control : 0) | (alt.Checked ? Keys.Alt : 0) | (shift.Checked ? Keys.Shift : 0);
-            string? failure = hotkey.Apply(value, persist);
+            string? failure = validate?.Invoke(value) ?? hotkey.Apply(value, persist);
             if (failure is null) { DialogResult = DialogResult.OK; Close(); } else error.Text = failure;
         };
         Controls.AddRange([hint, row, error, save, cancel]); AcceptButton = save; CancelButton = cancel;
