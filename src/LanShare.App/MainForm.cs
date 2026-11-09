@@ -14,6 +14,10 @@ internal sealed class MainForm : Form
     private readonly X509Certificate2 identity;
     private readonly ScreenshotHotkey screenshotHotkey;
     private readonly ScreenshotController screenshots;
+    private readonly ScreenRecordingController recording = new();
+    private readonly Button recordButton = MakeButton("区域录屏", width: 115);
+    private readonly System.Windows.Forms.Timer recordingTimer = new() { Interval = 1000 };
+    private bool closingRecording;
     private readonly CheckBox startup = new() { Text = "开机自启动（后台）", AutoSize = true };
     private readonly Button captureButton = MakeButton("截图 Ctrl+Alt+A", width: 180);
     private bool suppressFirstShow, runtimeInitialized, updatingStartup, shortcutSettingsOpen;
@@ -64,6 +68,12 @@ internal sealed class MainForm : Form
         startup.CheckedChanged += (_, _) => ChangeStartupSetting();
         captureButton.Click += async (_, _) => await CaptureScreenshotAsync();
         screenshotHotkey.Pressed += async () => await CaptureScreenshotAsync();
+        recordButton.Click += async (_, _) => await ToggleRecordingAsync();
+        recording.Changed += RefreshRecordingState;
+        recording.Notice += text => { Log("录屏", text); if (!shuttingDown) tray.ShowBalloonTip(4000, "区域录屏", text, text.Contains("失败") ? ToolTipIcon.Warning : ToolTipIcon.Info); };
+        recordingTimer.Tick += (_, _) => RefreshRecordingState();
+        Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanging += OnDisplaySettingsChanging;
         screenshots.Notice += text => { Log("截图", text); if (!Visible && (text.Contains("失败") || text.Contains("占用"))) tray.ShowBalloonTip(3000, "截图", text, ToolTipIcon.Warning); };
         start.Click += (_, _) => ToggleSharing();
         browse.Click += (_, _) => ChooseFolder();
@@ -77,13 +87,18 @@ internal sealed class MainForm : Form
         var captureItem = trayMenu.Items.Add("截图", null, async (_, _) => await CaptureScreenshotAsync());
         var lastItem = trayMenu.Items.Add("查看 / 保存上次截图", null, (_, _) => screenshots.ShowLast());
         trayMenu.Items.Add("截图快捷键…", null, (_, _) => ConfigureScreenshot());
+        var recordItem = trayMenu.Items.Add("区域录屏…", null, async (_, _) => await ToggleRecordingAsync());
+        var videoItem = trayMenu.Items.Add("打开上次录屏位置", null, (_, _) => recording.ShowLast());
         trayMenu.Items.Add(new ToolStripSeparator());
         var startupItem = new ToolStripMenuItem("开机自启动") { CheckOnClick = true };
         startupItem.CheckedChanged += (_, _) => { if (!updatingStartup) startup.Checked = startupItem.Checked; };
         trayMenu.Items.Add(startupItem);
         trayMenu.Opening += (_, _) =>
         {
-            captureItem.Text = "截图 (" + screenshotHotkey.Label + ")"; captureItem.Enabled = !screenshots.IsCapturing;
+            captureItem.Text = "截图 (" + screenshotHotkey.Label + ")"; captureItem.Enabled = !screenshots.IsCapturing && !recording.IsBusy;
+            recordItem.Text = recording.IsStopping ? "正在保存录屏…" : recording.IsRecording ? "停止录屏并保存" : "区域录屏…";
+            recordItem.Enabled = !shuttingDown && !screenshots.IsCapturing && !shortcutSettingsOpen && !recording.IsStopping && (!recording.IsBusy || recording.IsRecording);
+            videoItem.Enabled = recording.LastVideo is not null;
             lastItem.Enabled = screenshots.HasImage; updatingStartup = true; startupItem.Checked = startup.Checked; updatingStartup = false;
         };
         trayMenu.Items.Add("退出", null, (_, _) => ExitApplication());
@@ -143,7 +158,7 @@ internal sealed class MainForm : Form
     // 全局热键、主界面和托盘共用同一截图入口，防止同时创建多个框选遮罩。
     private async Task CaptureScreenshotAsync()
     {
-        if (shuttingDown || screenshots.IsCapturing || shortcutSettingsOpen) return;
+        if (shuttingDown || screenshots.IsCapturing || shortcutSettingsOpen || recording.IsBusy) return;
         bool restore = Visible;
         if (restore) Hide();
         try { await screenshots.CaptureAsync(); }
@@ -153,7 +168,7 @@ internal sealed class MainForm : Form
     // 快捷键保存失败时回滚配置，热键窗口会保留原先的有效组合。
     private void ConfigureScreenshot()
     {
-        if (screenshots.IsCapturing || shortcutSettingsOpen) return;
+        if (screenshots.IsCapturing || shortcutSettingsOpen || recording.IsBusy) return;
         shortcutSettingsOpen = true;
         try
         {
@@ -165,6 +180,50 @@ internal sealed class MainForm : Form
             dialog.ShowDialog(); captureButton.Text = "截图 " + screenshotHotkey.Label;
         }
         finally { shortcutSettingsOpen = false; }
+    }
+
+    // 同一按钮负责开始与停止；录制期间不自动恢复主窗口以免遮挡选区。
+    private async Task ToggleRecordingAsync()
+    {
+        if (shuttingDown || screenshots.IsCapturing || shortcutSettingsOpen || recording.IsStopping) return;
+        if (recording.IsRecording) { await recording.StopAsync(); return; }
+        if (recording.IsBusy) return;
+        bool restore = Visible;
+        if (restore) Hide();
+        try { await recording.StartAsync(); }
+        finally { if (restore && !shuttingDown && !IsDisposed) RestoreWindow(); }
+    }
+
+    // 托盘图标和计时提示持续标明录制状态，停止时恢复原有共享状态。
+    private void RefreshRecordingState()
+    {
+        if (IsDisposed) return;
+        recordButton.Text = recording.IsStopping ? "正在保存…" : recording.IsRecording ? "停止录屏" : "区域录屏";
+        recordButton.Enabled = !shuttingDown && !recording.IsStopping && (!recording.IsBusy || recording.IsRecording);
+        captureButton.Enabled = !recording.IsBusy;
+        tray.Icon = recording.IsBusy ? SystemIcons.Warning : appIcon;
+        if (recording.IsBusy)
+        {
+            tray.Text = recording.IsStopping ? "局域共享 · 正在保存录屏" : recording.IsRecording ? $"局域共享 · 录屏 {recording.Elapsed:hh\\:mm\\:ss} · 右键停止" : "局域共享 · 正在选择录屏区域";
+            recordingTimer.Start();
+        }
+        else { recordingTimer.Stop(); tray.Text = network is null ? "局域共享 · 未开启" : "局域共享 · 共享中"; }
+    }
+
+    // 锁屏后停止并保存，解锁不会自动继续录制。
+    private void OnSessionSwitch(object sender, Microsoft.Win32.SessionSwitchEventArgs e)
+    {
+        if (e.Reason == Microsoft.Win32.SessionSwitchReason.SessionLock) Ui(() => { if (recording.IsRecording) _ = recording.StopAsync(); });
+    }
+
+    // 显示器布局改变后原坐标可能失效，及时停止，避免录到选区之外的屏幕内容。
+    private void OnDisplaySettingsChanging(object? sender, EventArgs e) => Ui(() => { if (recording.IsRecording) _ = recording.StopAsync(); });
+
+    // 明确退出先完成视频索引，再进入原有资源释放路径。
+    private async Task FinishRecordingAndExitAsync()
+    {
+        await recording.StopAsync(exiting: true);
+        ExitApplication();
     }
     // 使用标准布局容器适应窗口缩放和系统 DPI。
     private void BuildLayout()
@@ -204,7 +263,8 @@ internal sealed class MainForm : Form
         startup.Margin = new Padding(3, 7, 18, 0);
         var lastScreenshot = MakeButton("查看 / 保存截图", width: 145); lastScreenshot.Click += (_, _) => screenshots.ShowLast();
         var shortcut = MakeButton("截图快捷键", width: 100); shortcut.Click += (_, _) => ConfigureScreenshot();
-        utilities.Controls.AddRange([startup, captureButton, lastScreenshot, shortcut]);
+        var lastVideo = MakeButton("录屏文件", width: 90); lastVideo.Click += (_, _) => recording.ShowLast();
+        utilities.Controls.AddRange([startup, captureButton, lastScreenshot, shortcut, recordButton, lastVideo]);
         settingsPanel.Controls.Add(utilities, 0, 3); settingsPanel.SetColumnSpan(utilities, 4);
         root.Controls.Add(settingsPanel, 0, 1);
 
@@ -547,12 +607,21 @@ internal sealed class MainForm : Form
             if (!smoke && !closeHintShown) { tray.ShowBalloonTip(2500, "局域共享仍在运行", "关闭窗口后继续共享。双击托盘图标打开；右键选择退出可结束程序。", ToolTipIcon.Info); closeHintShown = true; }
             base.OnFormClosing(e); return;
         }
+        if (recording.IsBusy)
+        {
+            e.Cancel = true;
+            if (!closingRecording) { closingRecording = true; shuttingDown = true; _ = FinishRecordingAndExitAsync(); }
+            base.OnFormClosing(e); return;
+        }
         shuttingDown = true;
         if (!smoke)
         {
             try { if (network is not null) settings.TrustedDeviceIds = network.TrustedIds.ToList(); settings.ClipboardEnabled = sync.Checked; settings.AutoAccept = accept.Checked; settings.ReceiveFolder = folder.Text; settings.Save(); }
             catch (Exception) { }
         }
+        Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanging -= OnDisplaySettingsChanging;
+        recordingTimer.Dispose(); recording.Dispose();
         screenshotHotkey.Dispose(); screenshots.Dispose(); StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
         base.OnFormClosing(e);
     }

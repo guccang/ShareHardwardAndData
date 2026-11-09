@@ -11,6 +11,11 @@ New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 $report = Join-Path $outputDir 'windows-self-test.txt'
 # 预览窗口完全透明，不弹出到用户桌面，也不建立网络连接。
 $appPath = Join-Path $repoRoot 'src\LanShare.App\bin\Release\net8.0-windows\SimpleLanShare.exe'
-$testProcess = Start-Process -FilePath $appPath -ArgumentList '--self-test', ('"' + $report + '"') -WindowStyle Hidden -Wait -PassThru
+$testProcess = Start-Process -FilePath $appPath -ArgumentList '--self-test', ('"' + $report + '"') -WindowStyle Hidden -PassThru
+# 只等待被测程序，避免 Start-Process -Wait 等待继承作业中的系统辅助进程。
+if (-not $testProcess.WaitForExit(120000)) {
+    $testProcess.Kill()
+    throw 'Windows 自检超时。'
+}
 Get-Content -LiteralPath $report
 if ($testProcess.ExitCode -ne 0) { throw 'Windows 自检失败。' }

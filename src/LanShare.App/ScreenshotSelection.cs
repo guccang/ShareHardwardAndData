@@ -7,14 +7,15 @@ internal sealed class ScreenshotSelection : Form
 {
     private readonly Bitmap desktopImage;
     private readonly Rectangle desktopBounds;
+    private readonly string instructions;
     private Point anchor;
     private bool dragging, finishing;
     public Rectangle Selected { get; private set; }
 
     // 截图位图由控制器持有，遮罩关闭时不重复释放。
-    public ScreenshotSelection(Bitmap image, Rectangle bounds)
+    public ScreenshotSelection(Bitmap image, Rectangle bounds, string instructions = "拖动框选 · Esc / 右键取消")
     {
-        desktopImage = image; desktopBounds = bounds;
+        desktopImage = image; desktopBounds = bounds; this.instructions = instructions;
         AutoScaleMode = AutoScaleMode.None; FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual; Bounds = bounds;
         ShowInTaskbar = false; TopMost = true; DoubleBuffered = true;
@@ -90,7 +91,7 @@ internal sealed class ScreenshotSelection : Form
             using var outline = new Pen(Color.FromArgb(32, 208, 178), 2);
             e.Graphics.DrawRectangle(outline, Selected);
         }
-        string hint = "拖动框选 · Esc / 右键取消" + (dragging ? $"  {Selected.Width} × {Selected.Height}" : "");
+        string hint = instructions + (dragging ? $"  {Selected.Width} × {Selected.Height}" : "");
         Size text = TextRenderer.MeasureText(hint, Font);
         Point pointer = PointToClient(Cursor.Position);
         var label = new Rectangle(Math.Clamp(pointer.X + 18, 0, Math.Max(0, ClientSize.Width - text.Width - 20)),

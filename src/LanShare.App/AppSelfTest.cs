@@ -43,6 +43,7 @@ internal static class AppSelfTest
         lines.Add("PASS: explicit tray exit disposes application");
         lines.Add("PASS: WinForms layout and clipboard listener initialization");
         lines.AddRange(DesktopFeatureTests.Run(Path.GetDirectoryName(Path.GetFullPath(report))!));
+        lines.AddRange(ScreenRecordingTests.Run(Path.GetDirectoryName(Path.GetFullPath(report))!));
         File.WriteAllLines(report, lines);
     }
 }
