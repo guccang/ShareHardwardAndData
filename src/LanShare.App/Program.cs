@@ -28,11 +28,11 @@ internal static class Program
         if (!firstInstance)
         {
             var window = FindWindow(null, "局域共享 · Simple LAN Share");
-            if (window != IntPtr.Zero) PostMessage(window, 0x8201, IntPtr.Zero, IntPtr.Zero);
+            if (!args.Contains("--background", StringComparer.OrdinalIgnoreCase) && window != IntPtr.Zero) PostMessage(window, 0x8201, IntPtr.Zero, IntPtr.Zero);
             return;
         }
         Application.ThreadException += (_, e) => MessageBox.Show(e.Exception.Message, "局域共享", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        try { Application.Run(new MainForm()); }
+        try { Application.Run(new MainForm(startInTray: !args.Contains("--show", StringComparer.OrdinalIgnoreCase))); }
         finally { instance.ReleaseMutex(); }
     }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindow(string? className, string windowName);

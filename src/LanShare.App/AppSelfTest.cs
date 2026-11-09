@@ -42,6 +42,7 @@ internal static class AppSelfTest
         if (!form.IsDisposed) throw new Exception("Explicit tray exit must dispose window");
         lines.Add("PASS: explicit tray exit disposes application");
         lines.Add("PASS: WinForms layout and clipboard listener initialization");
+        lines.AddRange(DesktopFeatureTests.Run(Path.GetDirectoryName(Path.GetFullPath(report))!));
         File.WriteAllLines(report, lines);
     }
 }

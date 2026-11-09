@@ -15,6 +15,8 @@ internal sealed class AppSettings
     public string ReceiveFolder { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "SimpleLanShare");
     public bool ClipboardEnabled { get; set; } = true;
     public bool AutoAccept { get; set; } = true;
+    public bool LaunchAtLogin { get; set; } = true;
+    public int ScreenshotShortcut { get; set; } = (int)ScreenshotHotkey.DefaultShortcut;
     private static readonly string FilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SimpleLanShare", "settings.json");
 
     // 损坏或旧版本配置不会阻止启动。

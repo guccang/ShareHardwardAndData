@@ -12,6 +12,11 @@ internal sealed class MainForm : Form
     private readonly AppSettings settings;
     private readonly ClipboardBridge clipboard;
     private readonly X509Certificate2 identity;
+    private readonly ScreenshotHotkey screenshotHotkey;
+    private readonly ScreenshotController screenshots;
+    private readonly CheckBox startup = new() { Text = "开机自启动（后台）", AutoSize = true };
+    private readonly Button captureButton = MakeButton("截图 Ctrl+Alt+A", width: 180);
+    private bool suppressFirstShow, runtimeInitialized, updatingStartup, shortcutSettingsOpen;
     private readonly TextBox folder = new() { ReadOnly = true, Dock = DockStyle.Fill };
     private readonly TextBox host = new() { PlaceholderText = "对方的局域网 IP", Width = 165 };
     private readonly Button start = MakeButton("开启共享", true);
@@ -35,24 +40,31 @@ internal sealed class MainForm : Form
     private readonly string baseTitle = "局域共享 · Simple LAN Share";
 
     // 正常启动自动发现设备；首次确认前不交换剪贴板或文件。
-    public MainForm(bool smoke = false)
+    public MainForm(bool smoke = false, bool startInTray = false)
     {
-        this.smoke = smoke;
+        this.smoke = smoke; suppressFirstShow = startInTray;
         settings = smoke ? new AppSettings() : AppSettings.Load();
         identity = settings.ReadIdentity();
         folder.Text = settings.ReceiveFolder;
         sync.Checked = settings.ClipboardEnabled; accept.Checked = settings.AutoAccept;
         AutoScaleDimensions = new SizeF(96, 96); AutoScaleMode = AutoScaleMode.Dpi;
-        Text = baseTitle; ClientSize = new Size(1000, 790); MinimumSize = new Size(940, 770);
+        Text = baseTitle; ClientSize = new Size(1000, 828); MinimumSize = new Size(940, 808);
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Microsoft YaHei UI", 9F);
         BackColor = Color.FromArgb(242, 246, 249);
         ForeColor = Color.FromArgb(28, 47, 65);
         Icon = appIcon; tray.Icon = appIcon;
+        screenshots = new ScreenshotController(appIcon);
+        screenshotHotkey = new ScreenshotHotkey((Keys)settings.ScreenshotShortcut, !smoke);
+        startup.Checked = settings.LaunchAtLogin;
         BuildLayout();
         clipboard = new ClipboardBridge();
         clipboard.Changed += content => { latestClipboard = content; _ = BroadcastClipboardAsync(); };
         clipboard.Notice += text => { detail.Text = text; };
+        startup.CheckedChanged += (_, _) => ChangeStartupSetting();
+        captureButton.Click += async (_, _) => await CaptureScreenshotAsync();
+        screenshotHotkey.Pressed += async () => await CaptureScreenshotAsync();
+        screenshots.Notice += text => { Log("截图", text); if (!Visible && (text.Contains("失败") || text.Contains("占用"))) tray.ShowBalloonTip(3000, "截图", text, ToolTipIcon.Warning); };
         start.Click += (_, _) => ToggleSharing();
         browse.Click += (_, _) => ChooseFolder();
         manual.Click += async (_, _) => await ConnectManuallyAsync();
@@ -62,19 +74,103 @@ internal sealed class MainForm : Form
         tray.DoubleClick += (_, _) => RestoreWindow();
         var trayMenu = new ContextMenuStrip();
         trayMenu.Items.Add("打开局域共享", null, (_, _) => RestoreWindow());
+        var captureItem = trayMenu.Items.Add("截图", null, async (_, _) => await CaptureScreenshotAsync());
+        var lastItem = trayMenu.Items.Add("查看 / 保存上次截图", null, (_, _) => screenshots.ShowLast());
+        trayMenu.Items.Add("截图快捷键…", null, (_, _) => ConfigureScreenshot());
+        trayMenu.Items.Add(new ToolStripSeparator());
+        var startupItem = new ToolStripMenuItem("开机自启动") { CheckOnClick = true };
+        startupItem.CheckedChanged += (_, _) => { if (!updatingStartup) startup.Checked = startupItem.Checked; };
+        trayMenu.Items.Add(startupItem);
+        trayMenu.Opening += (_, _) =>
+        {
+            captureItem.Text = "截图 (" + screenshotHotkey.Label + ")"; captureItem.Enabled = !screenshots.IsCapturing;
+            lastItem.Enabled = screenshots.HasImage; updatingStartup = true; startupItem.Checked = startup.Checked; updatingStartup = false;
+        };
         trayMenu.Items.Add("退出", null, (_, _) => ExitApplication());
         tray.ContextMenuStrip = trayMenu;
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized && !smoke) Hide(); };
         RefreshPeers();
         UpdateState("自动发现 · 首次连接需要双方确认", "各台电脑打开软件即可；确认过的设备下次自动连接，无需共享码。");
-        Shown += (_, _) => { if (!smoke) ToggleSharing(); };
+        captureButton.Text = "截图 " + screenshotHotkey.Label;
+        Shown += (_, _) => InitializeRuntime();
     }
 
+    // 第一次显示被真正抑制，后台启动不先闪现窗口；消息循环仍由主窗体保持。
+    protected override void SetVisibleCore(bool value)
+    {
+        if (value && suppressFirstShow)
+        {
+            suppressFirstShow = false; ShowInTaskbar = false;
+            _ = Handle;
+            BeginInvoke(new Action(InitializeRuntime));
+            base.SetVisibleCore(false); return;
+        }
+        base.SetVisibleCore(value);
+    }
+
+    // 无论隐藏启动还是打开窗口都只初始化一次，恢复窗口不会反向停止已建立连接。
+    private void InitializeRuntime()
+    {
+        if (runtimeInitialized || shuttingDown) return;
+        runtimeInitialized = true;
+        if (smoke) return;
+        try { StartupRegistration.SetEnabled(settings.LaunchAtLogin, StartupRegistration.CurrentCommand()); settings.Save(); }
+        catch (Exception ex) { Log("自启动设置失败", ex.Message); tray.ShowBalloonTip(3000, "自启动设置失败", "可打开窗口重新设置：" + ex.Message, ToolTipIcon.Warning); }
+        ToggleSharing();
+        if (screenshotHotkey.Error is not null) { Log("截图快捷键", screenshotHotkey.Error); tray.ShowBalloonTip(3000, "截图快捷键未注册", screenshotHotkey.Error, ToolTipIcon.Warning); }
+        else if (!Visible) tray.ShowBalloonTip(2000, "局域共享已在后台运行", screenshotHotkey.Label + " 截图；双击托盘图标打开窗口。", ToolTipIcon.Info);
+    }
+
+    // 用户选项立即写入当前用户启动项，失败时恢复界面和先前配置。
+    private void ChangeStartupSetting()
+    {
+        if (smoke || updatingStartup) return;
+        bool previous = settings.LaunchAtLogin;
+        try
+        {
+            StartupRegistration.SetEnabled(startup.Checked, StartupRegistration.CurrentCommand());
+            settings.LaunchAtLogin = startup.Checked; settings.Save();
+            Log("自启动", startup.Checked ? "已开启：登录 Windows 后在托盘运行并自动连接" : "已关闭开机自启动");
+        }
+        catch (Exception ex)
+        {
+            settings.LaunchAtLogin = previous; updatingStartup = true; startup.Checked = previous; updatingStartup = false;
+            try { StartupRegistration.SetEnabled(previous, StartupRegistration.CurrentCommand()); } catch { }
+            Log("自启动设置失败", ex.Message);
+        }
+    }
+
+    // 全局热键、主界面和托盘共用同一截图入口，防止同时创建多个框选遮罩。
+    private async Task CaptureScreenshotAsync()
+    {
+        if (shuttingDown || screenshots.IsCapturing || shortcutSettingsOpen) return;
+        bool restore = Visible;
+        if (restore) Hide();
+        try { await screenshots.CaptureAsync(); }
+        finally { if (restore && !shuttingDown && !IsDisposed) RestoreWindow(); }
+    }
+
+    // 快捷键保存失败时回滚配置，热键窗口会保留原先的有效组合。
+    private void ConfigureScreenshot()
+    {
+        if (screenshots.IsCapturing || shortcutSettingsOpen) return;
+        shortcutSettingsOpen = true;
+        try
+        {
+            using var dialog = new ScreenshotSettingsDialog(screenshotHotkey, value =>
+            {
+                int previous = settings.ScreenshotShortcut; settings.ScreenshotShortcut = (int)value;
+                try { settings.Save(); } catch { settings.ScreenshotShortcut = previous; throw; }
+            }, appIcon);
+            dialog.ShowDialog(); captureButton.Text = "截图 " + screenshotHotkey.Label;
+        }
+        finally { shortcutSettingsOpen = false; }
+    }
     // 使用标准布局容器适应窗口缩放和系统 DPI。
     private void BuildLayout()
     {
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24, 16, 24, 18), ColumnCount = 1, RowCount = 6 };
-        foreach (int height in new[] { 72, 128, 83, 126, 65 }) root.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
+        foreach (int height in new[] { 72, 166, 83, 126, 65 }) root.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         Controls.Add(root);
         var title = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
@@ -83,12 +179,12 @@ internal sealed class MainForm : Form
         title.Controls.Add(new Label { Text = "自己的电脑，数据随手可达。  /  剪贴板同步 · 文件拖拽互传", AutoSize = true, ForeColor = Color.FromArgb(91, 110, 127), Margin = new Padding(2, 6, 0, 0) });
         root.Controls.Add(title, 0, 0);
 
-        var settingsPanel = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Padding = new Padding(12), ColumnCount = 4, RowCount = 3 };
+        var settingsPanel = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Padding = new Padding(12), ColumnCount = 4, RowCount = 4 };
         settingsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 80));
         settingsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         settingsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
         settingsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
-        for (int i = 0; i < 3; i++) settingsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        for (int i = 0; i < 4; i++) settingsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         settingsPanel.Controls.Add(Caption("本机设备"), 0, 0);
         settingsPanel.Controls.Add(new Label { Text = Environment.MachineName + "  ·  自动发现附近电脑", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 1, 0);
         var pairingTools = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
@@ -104,6 +200,12 @@ internal sealed class MainForm : Form
         sync.Margin = new Padding(3, 7, 18, 0); accept.Margin = new Padding(3, 7, 18, 0);
         var shareNow = MakeButton("同步当前剪贴板", width: 145); shareNow.Click += (_, _) => clipboard.ShareNow();
         options.Controls.AddRange([sync, accept, shareNow]); settingsPanel.Controls.Add(options, 1, 2); settingsPanel.SetColumnSpan(options, 3);
+        var utilities = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
+        startup.Margin = new Padding(3, 7, 18, 0);
+        var lastScreenshot = MakeButton("查看 / 保存截图", width: 145); lastScreenshot.Click += (_, _) => screenshots.ShowLast();
+        var shortcut = MakeButton("截图快捷键", width: 100); shortcut.Click += (_, _) => ConfigureScreenshot();
+        utilities.Controls.AddRange([startup, captureButton, lastScreenshot, shortcut]);
+        settingsPanel.Controls.Add(utilities, 0, 3); settingsPanel.SetColumnSpan(utilities, 4);
         root.Controls.Add(settingsPanel, 0, 1);
 
         var peers = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(0, 10, 0, 0) };
@@ -183,7 +285,7 @@ internal sealed class MainForm : Form
             UpdateState("共享已开启 · 正在发现电脑", "首次连接会自动弹出确认；核对两台电脑的短校验码后同意，下次自动重连。");
             Log("自动发现", "正在寻找局域网电脑，已配对设备自动连接");
         }
-        catch (Exception ex) { StopSharing(); Log("开启失败", ex.Message); MessageBox.Show(this, ex.Message, "无法开启共享", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        catch (Exception ex) { StopSharing(); Log("开启失败", ex.Message); if (Visible) MessageBox.Show(this, ex.Message, "无法开启共享", MessageBoxButtons.OK, MessageBoxIcon.Warning); else tray.ShowBalloonTip(3000, "无法开启共享", ex.Message, ToolTipIcon.Warning); }
     }
 
     // 所有旧会话回调都用所属网络实例过滤，避免重启共享后旧消息污染新状态。
@@ -427,7 +529,7 @@ internal sealed class MainForm : Form
     }
 
     // 从托盘恢复窗口，并带到前台。
-    private void RestoreWindow() { Show(); WindowState = FormWindowState.Normal; Activate(); }
+    internal void RestoreWindow() { suppressFirstShow = false; ShowInTaskbar = true; Show(); WindowState = FormWindowState.Normal; Activate(); }
 
     // 已在后台运行时，第二次启动通过本机窗口消息恢复当前窗口。
     protected override void WndProc(ref System.Windows.Forms.Message message)
@@ -451,7 +553,7 @@ internal sealed class MainForm : Form
             try { if (network is not null) settings.TrustedDeviceIds = network.TrustedIds.ToList(); settings.ClipboardEnabled = sync.Checked; settings.AutoAccept = accept.Checked; settings.ReceiveFolder = folder.Text; settings.Save(); }
             catch (Exception) { }
         }
-        StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
+        screenshotHotkey.Dispose(); screenshots.Dispose(); StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
         base.OnFormClosing(e);
     }
 
