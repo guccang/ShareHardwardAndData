@@ -2,22 +2,23 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using LanShare.Core;
+using System.Security.Cryptography.X509Certificates;
 
 namespace LanShare.App;
 
-// 原生 Windows 桌面界面：共享组、文件投递区和接收列表集中在同一窗口。
+// 原生 Windows 桌面界面：设备配对、文件投递区和接收列表集中在同一窗口。
 internal sealed class MainForm : Form
 {
     private readonly AppSettings settings;
     private readonly ClipboardBridge clipboard;
-    private readonly TextBox code = new() { UseSystemPasswordChar = true, Dock = DockStyle.Fill };
+    private readonly X509Certificate2 identity;
     private readonly TextBox folder = new() { ReadOnly = true, Dock = DockStyle.Fill };
     private readonly TextBox host = new() { PlaceholderText = "对方的局域网 IP", Width = 165 };
     private readonly Button start = MakeButton("开启共享", true);
     private readonly Button manual = MakeButton("连接 IP");
     private readonly Button browse = MakeButton("更改目录");
     private readonly CheckBox sync = new() { Text = "同步文字和图片剪贴板", AutoSize = true };
-    private readonly CheckBox accept = new() { Text = "自动接收同组文件", AutoSize = true };
+    private readonly CheckBox accept = new() { Text = "自动接收已配对设备文件", AutoSize = true };
     private readonly ComboBox targets = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 210 };
     private readonly Label state = new() { AutoSize = false, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft };
     private readonly Label detail = new() { AutoSize = false, Dock = DockStyle.Fill, ForeColor = Color.FromArgb(91, 110, 127) };
@@ -28,16 +29,17 @@ internal sealed class MainForm : Form
     private readonly SemaphoreSlim sends = new(1);
     private PeerNetwork? network;
     private ClipboardContent? latestClipboard;
-    private bool broadcasting, shuttingDown;
+    private bool broadcasting, shuttingDown, exitRequested, closeHintShown;
+    private readonly Icon appIcon = LoadAppIcon();
     private readonly bool smoke;
     private readonly string baseTitle = "局域共享 · Simple LAN Share";
 
-    // 启动只读取本地设置；用户点击开启共享之后才监听网络和同步剪贴板。
+    // 正常启动自动发现设备；首次确认前不交换剪贴板或文件。
     public MainForm(bool smoke = false)
     {
         this.smoke = smoke;
         settings = smoke ? new AppSettings() : AppSettings.Load();
-        code.Text = smoke ? "0123456789ABCDEF0123456789ABCDEF" : settings.ReadCode();
+        identity = settings.ReadIdentity();
         folder.Text = settings.ReceiveFolder;
         sync.Checked = settings.ClipboardEnabled; accept.Checked = settings.AutoAccept;
         AutoScaleDimensions = new SizeF(96, 96); AutoScaleMode = AutoScaleMode.Dpi;
@@ -46,6 +48,7 @@ internal sealed class MainForm : Form
         Font = new Font("Microsoft YaHei UI", 9F);
         BackColor = Color.FromArgb(242, 246, 249);
         ForeColor = Color.FromArgb(28, 47, 65);
+        Icon = appIcon; tray.Icon = appIcon;
         BuildLayout();
         clipboard = new ClipboardBridge();
         clipboard.Changed += content => { latestClipboard = content; _ = BroadcastClipboardAsync(); };
@@ -59,11 +62,12 @@ internal sealed class MainForm : Form
         tray.DoubleClick += (_, _) => RestoreWindow();
         var trayMenu = new ContextMenuStrip();
         trayMenu.Items.Add("打开局域共享", null, (_, _) => RestoreWindow());
-        trayMenu.Items.Add("退出", null, (_, _) => Close());
+        trayMenu.Items.Add("退出", null, (_, _) => ExitApplication());
         tray.ContextMenuStrip = trayMenu;
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized && !smoke) Hide(); };
         RefreshPeers();
-        UpdateState("尚未开启共享", "在各台电脑填入相同共享码，然后开启共享。剪贴板会同步到所有在线电脑。");
+        UpdateState("自动发现 · 首次连接需要双方确认", "各台电脑打开软件即可；确认过的设备下次自动连接，无需共享码。");
+        Shown += (_, _) => { if (!smoke) ToggleSharing(); };
     }
 
     // 使用标准布局容器适应窗口缩放和系统 DPI。
@@ -85,14 +89,13 @@ internal sealed class MainForm : Form
         settingsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
         settingsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
         for (int i = 0; i < 3; i++) settingsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        settingsPanel.Controls.Add(Caption("共享码"), 0, 0);
-        settingsPanel.Controls.Add(code, 1, 0);
-        var codeTools = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
-        var copy = MakeButton("复制", width: 58); var reveal = new CheckBox { Text = "显示", AutoSize = true, Margin = new Padding(8, 5, 0, 0) };
-        copy.Click += (_, _) => { try { Clipboard.SetText(code.Text); } catch (System.Runtime.InteropServices.ExternalException) { Log("提示", "剪贴板被占用，请稍后重试"); } };
-        reveal.CheckedChanged += (_, _) => code.UseSystemPasswordChar = !reveal.Checked;
-        codeTools.Controls.AddRange([copy, reveal]); settingsPanel.Controls.Add(codeTools, 2, 0);
-        settingsPanel.Controls.Add(start, 3, 0);
+        settingsPanel.Controls.Add(Caption("本机设备"), 0, 0);
+        settingsPanel.Controls.Add(new Label { Text = Environment.MachineName + "  ·  自动发现附近电脑", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 1, 0);
+        var pairingTools = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
+        var retry = MakeButton("重新配对", width: 82); var forget = MakeButton("清除信任", width: 82);
+        retry.Click += (_, _) => { if (network is null) ToggleSharing(); else network.RetryPairing(); Log("配对", "已允许重新发起连接确认"); };
+        forget.Click += (_, _) => ForgetDevices();
+        pairingTools.Controls.AddRange([retry, forget]); settingsPanel.Controls.Add(pairingTools, 2, 0);        settingsPanel.Controls.Add(start, 3, 0);
         settingsPanel.Controls.Add(Caption("接收目录"), 0, 1); settingsPanel.Controls.Add(folder, 1, 1);
         var folderTools = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
         folderTools.Controls.Add(browse); var open = MakeButton("打开", width: 58); open.Click += (_, _) => OpenFolder(); folderTools.Controls.Add(open);
@@ -157,33 +160,33 @@ internal sealed class MainForm : Form
         catch (SocketException) { return "未检测到 IPv4 地址"; }
     }
 
-    // 建立共享组后保存当前用户设置，并禁止运行中修改组身份和接收目录。
+    // 开启共享后保存设备身份，并禁止运行中修改接收目录。
     private void ToggleSharing()
     {
         if (network is not null) { StopSharing(); return; }
         try
         {
-            Security.ParseCode(code.Text);
             Directory.CreateDirectory(folder.Text);
             settings.ReceiveFolder = folder.Text; settings.ClipboardEnabled = sync.Checked; settings.AutoAccept = accept.Checked;
-            settings.Save(code.Text);
-            var current = new PeerNetwork(code.Text, folder.Text);
+            settings.Save();
+            var current = new PeerNetwork(identity, folder.Text, settings.TrustedDeviceIds);
             network = current;
             current.Status += text => Ui(() => { if (network == current) Log("连接", text); });
             current.PeerConnected += peer => AttachPeer(current, peer);
             current.PeerDisconnected += (peer, reason) => Ui(() => { if (network == current) { RefreshPeers(); Log(peer.PeerName, "已断开：" + reason); } });
+            current.ConfirmPeerAsync = (request, ct) => ConfirmPeerAsync(current, request, ct);
             current.Start();
             clipboard.Enabled = sync.Checked;
-            code.Enabled = browse.Enabled = false; start.Text = "停止共享";
+            browse.Enabled = false; start.Text = "停止共享";
             tray.Text = "局域共享 · 已开启";
             RefreshPeers();
-            UpdateState("共享已开启 · 正在发现同组电脑", "所有电脑使用相同共享码；在任意一台重新复制内容即可同步。最小化后留在托盘。");
-            Log("共享组", "已开启局域网发现和加密直连");
+            UpdateState("共享已开启 · 正在发现电脑", "首次连接会自动弹出确认；核对两台电脑的短校验码后同意，下次自动重连。");
+            Log("自动发现", "正在寻找局域网电脑，已配对设备自动连接");
         }
         catch (Exception ex) { StopSharing(); Log("开启失败", ex.Message); MessageBox.Show(this, ex.Message, "无法开启共享", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
     }
 
-    // 所有旧会话回调都用所属共享组过滤，避免重启共享后旧消息污染新状态。
+    // 所有旧会话回调都用所属网络实例过滤，避免重启共享后旧消息污染新状态。
     private void AttachPeer(PeerNetwork current, PeerSession peer)
     {
         peer.ClipboardReceived += content => Ui(() => { if (network == current && peer.IsConnected) clipboard.Receive(content); });
@@ -197,10 +200,57 @@ internal sealed class MainForm : Form
         peer.Progress += progress => Ui(() => { if (network == current) ShowProgress(peer, progress); });
         peer.Notice += text => Ui(() => { if (network == current) Log(peer.PeerName, text); });
         peer.ConfirmFileAsync = (offer, ct) => ConfirmFileAsync(current, peer, offer, ct);
-        Ui(() => { if (network == current) { RefreshPeers(); Log(peer.PeerName, "已连接 · 剪贴板同步到所有在线电脑"); } });
+        Ui(() =>
+        {
+            if (network != current) return;
+            settings.TrustedDeviceIds = current.TrustedIds.ToList();
+            try { settings.Save(); } catch (Exception ex) { Log("保存信任失败", ex.Message); }
+            RefreshPeers(); Log(peer.PeerName, "已连接并记住此设备，下次自动连接");
+        });
     }
 
-    // 默认允许同组自有电脑发送；关闭自动接收后使用可超时关闭的独立确认窗。
+    // 两台电脑显示相同校验码，用户只需核对并点击，无需输入或复制共享码。
+    private Task<bool> ConfirmPeerAsync(PeerNetwork current, PairingRequest request, CancellationToken ct)
+    {
+        var result = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var registration = ct.Register(() => result.TrySetCanceled(ct));
+        Ui(() =>
+        {
+            if (result.Task.IsCompleted || network != current) { result.TrySetResult(false); return; }
+            var dialog = new Form
+            {
+                Text = "发现新电脑 · 确认连接", ClientSize = new Size(500, 270), Font = Font,
+                StartPosition = FormStartPosition.CenterScreen, FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false, MinimizeBox = false, Icon = Icon
+            };
+            var info = new Label
+            {
+                Text = $"{request.Name}\n{request.Address}\n\n请核对两台电脑显示的校验码一致，无需输入：\n\n{request.VerificationCode}\n\n确认后记住此设备，允许同步剪贴板和收发文件。",
+                Dock = DockStyle.Fill, Padding = new Padding(20), Font = new Font(Font.FontFamily, 11)
+            };
+            var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 45, FlowDirection = FlowDirection.RightToLeft };
+            var yes = MakeButton("确认连接", true); var no = MakeButton("拒绝");
+            yes.Click += (_, _) => { result.TrySetResult(true); dialog.Close(); };
+            no.Click += (_, _) => { result.TrySetResult(false); dialog.Close(); };
+            dialog.FormClosed += (_, _) => { result.TrySetResult(false); dialog.Dispose(); };
+            buttons.Controls.AddRange([yes, no]); dialog.Controls.Add(info); dialog.Controls.Add(buttons);
+            dialog.AcceptButton = yes; dialog.CancelButton = no; dialog.Show(this);
+            if (!Visible) tray.ShowBalloonTip(3000, "发现新电脑", request.Name + " 等待连接确认", ToolTipIcon.Info);
+            _ = result.Task.ContinueWith(_ => Ui(() => { if (!dialog.IsDisposed) dialog.Close(); }), TaskScheduler.Default);
+        });
+        _ = result.Task.ContinueWith(_ => registration.Dispose(), TaskScheduler.Default);
+        return result.Task;
+    }
+
+    // 清除本机信任后暂停共享，下一次连接必须重新确认，不影响磁盘上的已收文件。
+    private void ForgetDevices()
+    {
+        if (MessageBox.Show(this, "清除已确认的设备并停止共享？下次连接需要重新确认。", "清除信任", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        StopSharing(); settings.TrustedDeviceIds.Clear();
+        try { settings.Save(); Log("配对", "已清除信任，点击开启共享可重新配对"); }
+        catch (Exception ex) { Log("设置保存失败", ex.Message); }
+    }
+    // 默认允许已配对的自有电脑发送；关闭自动接收后使用可超时关闭的独立确认窗。
     private Task<bool> ConfirmFileAsync(PeerNetwork current, PeerSession peer, FileOffer offer, CancellationToken ct)
     {
         var result = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -284,7 +334,7 @@ internal sealed class MainForm : Form
         { Log("提示", "请输入对方的 IPv4 地址，例如 192.168.1.20"); return; }
         manual.Enabled = false;
         try { await current.ConnectAsync(address.ToString()); }
-        catch (Exception ex) { if (network == current) Log("连接失败", ex is OperationCanceledException ? "连接超时，请检查 IP、共享码和防火墙" : ex.Message); }
+        catch (Exception ex) { if (network == current) Log("连接失败", ex is OperationCanceledException ? "连接超时，请检查 IP、防火墙或两端确认窗口" : ex.Message); }
         finally { if (!IsDisposed) manual.Enabled = true; }
     }
 
@@ -370,27 +420,51 @@ internal sealed class MainForm : Form
     private void StopSharing()
     {
         var previous = network; network = null;
+        if (previous is not null) settings.TrustedDeviceIds = previous.TrustedIds.ToList();
         clipboard.Enabled = false; latestClipboard = null; previous?.Dispose();
-        code.Enabled = browse.Enabled = true; start.Text = "开启共享"; tray.Text = "局域共享 · 未开启";
-        RefreshPeers(); UpdateState("共享已停止", "剪贴板不再同步；正在传输的任务已取消。重新开启可再次加入共享组。");
+        browse.Enabled = true; start.Text = "开启共享"; tray.Text = "局域共享 · 未开启";
+        RefreshPeers(); UpdateState("共享已停止", "剪贴板不再同步；正在传输的任务已取消。重新开启可再次自动连接。");
     }
 
     // 从托盘恢复窗口，并带到前台。
     private void RestoreWindow() { Show(); WindowState = FormWindowState.Normal; Activate(); }
 
-    // 关闭窗口即退出；最小化才留在托盘，避免产生难以退出的后台进程。
+    // 已在后台运行时，第二次启动通过本机窗口消息恢复当前窗口。
+    protected override void WndProc(ref System.Windows.Forms.Message message)
+    {
+        if (message.Msg == 0x8201) { RestoreWindow(); return; }
+        base.WndProc(ref message);
+    }
+
+    // 点击关闭只隐藏到托盘；托盘退出、系统关机和自检模式才真正释放资源。
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        if (!exitRequested && e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true; Hide();
+            if (!smoke && !closeHintShown) { tray.ShowBalloonTip(2500, "局域共享仍在运行", "关闭窗口后继续共享。双击托盘图标打开；右键选择退出可结束程序。", ToolTipIcon.Info); closeHintShown = true; }
+            base.OnFormClosing(e); return;
+        }
         shuttingDown = true;
         if (!smoke)
         {
-            try { settings.ClipboardEnabled = sync.Checked; settings.AutoAccept = accept.Checked; settings.ReceiveFolder = folder.Text; settings.Save(code.Text); }
+            try { if (network is not null) settings.TrustedDeviceIds = network.TrustedIds.ToList(); settings.ClipboardEnabled = sync.Checked; settings.AutoAccept = accept.Checked; settings.ReceiveFolder = folder.Text; settings.Save(); }
             catch (Exception) { }
         }
-        StopSharing(); clipboard.Dispose(); tray.Visible = false; tray.Dispose();
+        StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
         base.OnFormClosing(e);
     }
 
+    // 托盘明确退出才结束后台共享；自检也使用相同的资源回收入口。
+    internal void ExitApplication() { exitRequested = true; Close(); }
+
+    // 从程序集读取多尺寸图标，单文件发布后窗口和托盘仍可直接使用。
+    private static Icon LoadAppIcon()
+    {
+        using var stream = typeof(MainForm).Assembly.GetManifestResourceStream("LanShare.App.Icon") ?? throw new InvalidOperationException("缺少应用图标。");
+        using var icon = new Icon(stream);
+        return (Icon)icon.Clone();
+    }
     // 无需启动网络或修改剪贴板即可生成界面快照，用于本地视觉验证。
     internal void SavePreview(string path)
     {

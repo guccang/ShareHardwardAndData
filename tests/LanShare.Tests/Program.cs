@@ -18,6 +18,7 @@ internal static class Program
         try
         {
             await ProtocolTestsAsync();
+            await PairingTestsAsync(root);
             await ThreePeerTestsAsync(root);
             await DiscoveryTestsAsync(root);
             Console.WriteLine($"PASS: {assertions} assertions; framing, authentication, three peers, clipboard, files, cancellation.");
@@ -43,25 +44,130 @@ internal static class Program
         foreach (string name in new[] { "../a", "..\\a", "C:\\x", "x:stream", "CON.txt", "nul", "LPT1.log", "bad.", "bad ", "a/b", "", "a\0b" })
             Throws<InvalidDataException>(() => SafeFiles.ValidateName(name), "unsafe file name " + name);
         SafeFiles.ValidateName("报告 2026.png"); Check(true, "unicode file name");
-        Throws<ArgumentException>(() => Security.ParseCode("123456"), "weak pairing code");
-        Check(Security.ParseCode(Security.NewPairingCode()).Length == 16, "128-bit pairing code");
+        Check(!Security.IsFingerprint("123456"), "invalid device fingerprint rejected");
+        using var identity = Security.CreateCertificate();
+        Check(Security.IsFingerprint(Security.Fingerprint(identity)), "certificate fingerprint identity");
         Throws<InvalidDataException>(() => PeerSession.ValidateClipboard("html", 5), "unknown clipboard format");
         Throws<InvalidDataException>(() => PeerSession.ValidateClipboard("text", PeerSession.MaxTextBytes + 1L), "text size limit");
         Throws<InvalidDataException>(() => PeerSession.ValidateClipboard("png", PeerSession.MaxImageBytes + 1L), "image size limit");
     }
 
+    // 真实双向 TLS 验证确认前隔离、双方同意、持久信任、冒充拒绝及取消。
+    private static async Task PairingTestsAsync(string root)
+    {
+        using var identityA = Security.CreateCertificate(); using var identityB = Security.CreateCertificate();
+        int portA = FreePort(), portB = FreePort(); while (portA == portB) portB = FreePort();
+        using var a = new PeerNetwork(identityA, root, port: portA);
+        using var b = new PeerNetwork(identityB, root, port: portB);
+        var promptA = new TaskCompletionSource<PairingRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var promptB = new TaskCompletionSource<PairingRequest>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var decisionA = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var decisionB = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        a.ConfirmPeerAsync = (request, ct) => { promptA.TrySetResult(request); return decisionA.Task.WaitAsync(ct); };
+        b.ConfirmPeerAsync = (request, ct) => { promptB.TrySetResult(request); return decisionB.Task.WaitAsync(ct); };
+        a.Start(false); b.Start(false);
+        var connect = a.ConnectAsync("127.0.0.1", portB);
+        var requestA = await promptA.Task.WaitAsync(TimeSpan.FromSeconds(8));
+        var requestB = await promptB.Task.WaitAsync(TimeSpan.FromSeconds(8));
+        Check(requestA.VerificationCode == requestB.VerificationCode && requestA.VerificationCode.Length == 6, "matching six-digit verification code on both ends");
+        Check(a.Sessions.Count == 0 && b.Sessions.Count == 0 && a.TrustedIds.Count == 0 && b.TrustedIds.Count == 0, "no data session or trust before confirmation");
+        decisionA.SetResult(true); await Task.Delay(150);
+        Check(a.Sessions.Count == 0 && b.Sessions.Count == 0, "one-sided approval cannot enable sharing");
+        decisionB.SetResult(true); await connect.WaitAsync(TimeSpan.FromSeconds(8));
+        await UntilAsync(() => a.Sessions.Count == 1 && b.Sessions.Count == 1);
+        Check(a.TrustedIds.Contains(b.NodeId) && b.TrustedIds.Contains(a.NodeId), "mutual approval remembers certificate identities");
+        string[] trustA = a.TrustedIds.ToArray(), trustB = b.TrustedIds.ToArray();
+        a.Dispose(); b.Dispose();
+        using var restoredA = new PeerNetwork(identityA, root, trustA, portA);
+        using var restoredB = new PeerNetwork(identityB, root, trustB, portB);
+        int prompts = 0;
+        restoredA.ConfirmPeerAsync = (_, _) => { Interlocked.Increment(ref prompts); return Task.FromResult(false); };
+        restoredB.ConfirmPeerAsync = (_, _) => { Interlocked.Increment(ref prompts); return Task.FromResult(false); };
+        restoredA.Start(false); restoredB.Start(false);
+        await restoredA.ConnectAsync("127.0.0.1", portB);
+        await UntilAsync(() => restoredB.Sessions.Count == 1);
+        Check(prompts == 0 && restoredA.Sessions.Count == 1, "persisted trust reconnects without prompts");
+
+        using var strangerIdentity = Security.CreateCertificate();
+        using var stranger = new PeerNetwork(strangerIdentity, root, port: FreePort());
+        stranger.ConfirmPeerAsync = (_, _) => Task.FromResult(true);
+        await ThrowsAsync<PairingRejectedException>(() => stranger.ConnectAsync("127.0.0.1", portB), "new certificate needs approval even with same machine name");
+        Check(prompts == 1 && stranger.TrustedIds.Count == 0 && restoredB.Sessions.Count == 1, "rejection stores no trust and preserves other sessions");
+        await ThrowsAsync<PairingRejectedException>(() => stranger.ConnectAsync("127.0.0.1", portB), "rejected peer remains blocked");
+        Check(prompts == 1, "rejected peer does not repeat confirmation prompt");
+        restoredB.RetryPairing();
+        restoredB.ConfirmPeerAsync = (_, _) => Task.FromResult(true);
+        await stranger.ConnectAsync("127.0.0.1", portB);
+        await UntilAsync(() => restoredB.Sessions.Count == 2);
+        Check(stranger.Sessions.Count == 1, "explicit retry can pair a previously refused device");
+
+        await ThrowsAsync<InvalidDataException>(async () =>
+        {
+            using var mismatch = await Connector.ConnectAsync("127.0.0.1", portB, strangerIdentity, root,
+                (_, _) => throw new Exception("Mismatched discovery must not prompt"), default, new string('0', 64));
+        }, "discovery identity is pinned to TLS certificate");
+        using var attacker = Security.CreateCertificate();
+        using (var tcp = new TcpClient())
+        {
+            await tcp.ConnectAsync(IPAddress.Loopback, portB);
+            using var tls = await Security.ConnectAsync(tcp.GetStream(), attacker, default);
+            await Wire.SendJsonAsync(tls, new Hello("control", "", Environment.MachineName, NodeId: restoredA.NodeId), default);
+            await ThrowsAsync<IOException>(() => Wire.ReadJsonAsync<Ready>(tls, default), "claimed trusted identity cannot override real certificate");
+        }
+        using (var tcp = new TcpClient())
+        {
+            await tcp.ConnectAsync(IPAddress.Loopback, portB);
+            using var tls = await Security.ConnectAsync(tcp.GetStream(), attacker, default);
+            await Wire.SendJsonAsync(tls, new Hello("bulk", new string('0',64), Environment.MachineName, NodeId: Security.Fingerprint(attacker)), default);
+            await ThrowsAsync<IOException>(() => Wire.ReadJsonAsync<Ready>(tls, default), "unconfirmed bulk channel rejected");
+        }
+
+        using var refusingIdentity = Security.CreateCertificate();
+        int refusalPort = FreePort();
+        using var refusing = new PeerNetwork(refusingIdentity, root, port: refusalPort);
+        var remoteCancelled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        refusing.ConfirmPeerAsync = (_, _) => Task.FromResult(false); refusing.Start(false);
+        await ThrowsAsync<PairingRejectedException>(async () =>
+        {
+            using var notConnected = await Connector.ConnectAsync("127.0.0.1", refusalPort, attacker, root, async (_, ct) =>
+            {
+                try { await Task.Delay(Timeout.Infinite, ct); return true; }
+                finally { remoteCancelled.TrySetResult(true); }
+            }, default);
+        }, "peer rejection closes a still-pending local confirmation");
+        Check(await remoteCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5)), "pending dialog cancellation is delivered immediately");
+        using var cancelA = new PeerNetwork(attacker, root, port: FreePort());
+        int cancelPort = FreePort();
+        // 独立等待方只开启一台监听，避免取消验证影响已经建立的连接。
+        using var waiting = new PeerNetwork(identityB, root, port: cancelPort);
+        var asked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        waiting.ConfirmPeerAsync = async (_, ct) => { asked.TrySetResult(true); await Task.Delay(Timeout.Infinite, ct); return false; };
+        cancelA.ConfirmPeerAsync = (_, _) => Task.FromResult(true);
+        waiting.Start(false);
+        using var cancellation = new CancellationTokenSource();
+        var cancelled = cancelA.ConnectAsync("127.0.0.1", cancelPort, cancellation.Token);
+        await asked.Task.WaitAsync(TimeSpan.FromSeconds(8)); cancellation.Cancel();
+        await ThrowsAsync<OperationCanceledException>(() => cancelled, "cancelling pending pairing closes the handshake");
+        Check(cancelA.TrustedIds.Count == 0 && waiting.TrustedIds.Count == 0 && waiting.Sessions.Count == 0, "cancelled pairing has no trust or data access");
+    }
     // 三个实例模拟三台电脑，使用回环网络的真实加密连接进行双向验证。
     private static async Task ThreePeerTestsAsync(string root)
     {
-        string group = Security.NewPairingCode();
+        using var identityA = Security.CreateCertificate();
+        using var identityB = Security.CreateCertificate();
         int[] ports = [FreePort(), FreePort(), FreePort()];
         while (ports.Distinct().Count() != 3) ports = [FreePort(), FreePort(), FreePort()];
         string aDir = Path.Combine(root, "A"), bDir = Path.Combine(root, "B"), cDir = Path.Combine(root, "C");
         Directory.CreateDirectory(aDir); Directory.CreateDirectory(bDir); Directory.CreateDirectory(cDir);
-        using var a = new PeerNetwork(group, aDir, ports[0]);
-        using var b = new PeerNetwork(group, bDir, ports[1]);
-        using var c = new PeerNetwork(group, cDir, ports[2]);
-        foreach (var peerNetwork in new[] { a, b, c }) peerNetwork.PeerConnected += peer => peer.ConfirmFileAsync = (_, _) => Task.FromResult(true);
+        using var identityC = Security.CreateCertificate();
+        using var a = new PeerNetwork(identityA, aDir, port: ports[0]);
+        using var b = new PeerNetwork(identityB, bDir, port: ports[1]);
+        using var c = new PeerNetwork(identityC, cDir, port: ports[2]);
+        foreach (var peerNetwork in new[] { a, b, c })
+        {
+            peerNetwork.ConfirmPeerAsync = (_, _) => Task.FromResult(true);
+            peerNetwork.PeerConnected += peer => peer.ConfirmFileAsync = (_, _) => Task.FromResult(true);
+        }
         a.Status += text => Console.WriteLine("A: " + text); b.Status += text => Console.WriteLine("B: " + text); c.Status += text => Console.WriteLine("C: " + text);
         a.Start(false); b.Start(false); c.Start(false);
         await a.ConnectAsync("127.0.0.1", ports[1]);
@@ -69,12 +175,6 @@ internal static class Program
         await b.ConnectAsync("127.0.0.1", ports[2]);
         await UntilAsync(() => a.Sessions.Count == 2 && b.Sessions.Count == 2 && c.Sessions.Count == 2);
         Check(true, "three-node mesh connected");
-        await ThrowsAsync<Exception>(async () =>
-        {
-            using var invalid = await Connector.ConnectAsync("127.0.0.1", ports[0], Security.NewPairingCode(), root, default);
-        }, "wrong pairing code rejected");
-        Check(a.Sessions.Count == 2, "wrong code does not disconnect valid peers");
-
         var ab = a.Sessions.Single(s => s.PeerId == b.NodeId);
         var ac = a.Sessions.Single(s => s.PeerId == c.NodeId);
         var ba = b.Sessions.Single(s => s.PeerId == a.NodeId);
@@ -139,28 +239,30 @@ internal static class Program
         await UntilAsync(() => a.Sessions.Count == 0 && b.Sessions.Count == 0 && c.Sessions.Count == 0);
     }
 
-    // 向隔离 UDP 端口注入发现报文，验证同组自动建连与不同组隔离。
+    // 向隔离 UDP 端口注入发现报文，验证新版发现自动触发已确认的连接。
     private static async Task DiscoveryTestsAsync(string root)
     {
-        string group = Security.NewPairingCode();
+        using var identityA = Security.CreateCertificate();
+        using var identityB = Security.CreateCertificate();
         int portA = FreePort(), portB = FreePort(), discovery = FreePort();
         while (new[] { portA, portB, discovery }.Distinct().Count() != 3) { portA = FreePort(); portB = FreePort(); discovery = FreePort(); }
-        using var a = new PeerNetwork(group, root, portA, discovery);
-        using var b = new PeerNetwork(group, root, portB, discovery);
+        using var a = new PeerNetwork(identityA, root, port: portA, discoveryPort: discovery);
+        using var b = new PeerNetwork(identityB, root, port: portB, discoveryPort: discovery);
         var lower = string.CompareOrdinal(a.NodeId, b.NodeId) < 0 ? a : b;
         var upper = lower == a ? b : a;
         int upperPort = upper == a ? portA : portB;
         lower.Status += text => Console.WriteLine("DISCOVERY: " + text);
         upper.Status += text => Console.WriteLine("UPPER: " + text);
+        a.ConfirmPeerAsync = (_, _) => Task.FromResult(true); b.ConfirmPeerAsync = (_, _) => Task.FromResult(true);
         upper.Start(false); lower.Start();
         using var udp = new UdpClient();
-        byte[] WrongPacket() => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { Protocol = "SimpleLanShare/1", Group = "wrong", NodeId = upper.NodeId, Port = upperPort });
+        byte[] WrongPacket() => System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { Protocol = "SimpleLanShare/1", NodeId = upper.NodeId, Port = upperPort });
         await udp.SendAsync(WrongPacket(), new IPEndPoint(IPAddress.Loopback, discovery));
         await Task.Delay(250);
-        Check(lower.Sessions.Count == 0, "different discovery group ignored");
+        Check(lower.Sessions.Count == 0, "legacy discovery protocol ignored");
         byte[] packet = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new
         {
-            Protocol = "SimpleLanShare/1", Group = Convert.ToHexString(SHA256.HashData(Security.ParseCode(group))), NodeId = upper.NodeId, Port = upperPort
+            Protocol = "SimpleLanShare/2", NodeId = upper.NodeId, Port = upperPort
         });
         // UDP 允许丢包，测试按实际广播行为重发，而不假设单个报文必达。
         for (int retry = 0; retry < 12 && (lower.Sessions.Count != 1 || upper.Sessions.Count != 1); retry++)

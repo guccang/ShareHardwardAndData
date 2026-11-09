@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace LanShare.App;
 
 // 应用入口：剪贴板和文件拖拽均要求 STA 消息循环。
@@ -18,10 +20,21 @@ internal static class Program
         {
             using var preview = new MainForm(true);
             preview.SavePreview(Path.GetFullPath(args[1]));
-            preview.Close();
+            preview.ExitApplication();
+            return;
+        }
+        // 关闭到托盘后再次运行同一软件只恢复已有窗口，避免端口和身份配置冲突。
+        using var instance = new Mutex(true, "Local\\SimpleLanShare.Desktop", out bool firstInstance);
+        if (!firstInstance)
+        {
+            var window = FindWindow(null, "局域共享 · Simple LAN Share");
+            if (window != IntPtr.Zero) PostMessage(window, 0x8201, IntPtr.Zero, IntPtr.Zero);
             return;
         }
         Application.ThreadException += (_, e) => MessageBox.Show(e.Exception.Message, "局域共享", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        Application.Run(new MainForm());
+        try { Application.Run(new MainForm()); }
+        finally { instance.ReleaseMutex(); }
     }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindow(string? className, string windowName);
+    [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
 }

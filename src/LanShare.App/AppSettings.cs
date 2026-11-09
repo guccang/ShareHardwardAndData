@@ -1,13 +1,17 @@
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using LanShare.Core;
 
 namespace LanShare.App;
 
-// 设置只保存到当前用户目录；共享码通过 Windows DPAPI 加密后落盘。
+// 设备私钥用 Windows DPAPI 加密保存；信任记录仅存储已确认设备的证书指纹。
 internal sealed class AppSettings
 {
-    public string ProtectedCode { get; set; } = "";
+    public string ProtectedIdentity { get; set; } = "";
+    public List<string> TrustedDeviceIds { get; set; } = [];
     public string ReceiveFolder { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "SimpleLanShare");
     public bool ClipboardEnabled { get; set; } = true;
     public bool AutoAccept { get; set; } = true;
@@ -21,22 +25,40 @@ internal sealed class AppSettings
     }
 
     // 用临时文件替换设置，避免异常退出留下半份 JSON。
-    public void Save(string code)
+    public void Save()
     {
-        ProtectedCode = Protect(code, false);
         Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
         File.WriteAllText(FilePath + ".tmp", JsonSerializer.Serialize(this));
         File.Move(FilePath + ".tmp", FilePath, true);
     }
 
-    // 设置移到另一 Windows 用户或电脑时，无法解密就生成新共享码。
-    public string ReadCode()
+    // 私钥无法解密或迁移到其他用户时生成新身份，清除旧信任，必须重新确认。
+    public X509Certificate2 ReadIdentity()
     {
-        try { return ProtectedCode.Length == 0 ? LanShare.Core.Security.NewPairingCode() : Protect(ProtectedCode, true); }
-        catch { return LanShare.Core.Security.NewPairingCode(); }
+        TrustedDeviceIds ??= [];
+        try
+        {
+            if (!string.IsNullOrEmpty(ProtectedIdentity))
+            {
+                byte[] bytes = Convert.FromBase64String(Protect(ProtectedIdentity, true));
+                try
+                {
+                    var certificate = Security.ImportCertificate(bytes);
+                    if (certificate.HasPrivateKey && certificate.NotAfter.ToUniversalTime() > DateTime.UtcNow.AddDays(1)) return certificate;
+                    certificate.Dispose();
+                }
+                finally { CryptographicOperations.ZeroMemory(bytes); }
+            }
+        }
+        catch (Exception ex) when (ex is CryptographicException or FormatException or System.ComponentModel.Win32Exception) { }
+        TrustedDeviceIds.Clear();
+        var fresh = Security.CreateCertificate();
+        byte[] pfx = fresh.Export(X509ContentType.Pfx);
+        try { ProtectedIdentity = Protect(Convert.ToBase64String(pfx), false); }
+        finally { CryptographicOperations.ZeroMemory(pfx); }
+        return fresh;
     }
-
-    // DPAPI 密钥由 Windows 当前用户保管；界面仍可显式复制共享码供其他设备加入。
+    // DPAPI 密钥由 Windows 当前用户保管，不向其他设备发送私钥。
     internal static string Protect(string value, bool decrypt)
     {
         byte[] bytes = decrypt ? Convert.FromBase64String(value) : Encoding.UTF8.GetBytes(value);

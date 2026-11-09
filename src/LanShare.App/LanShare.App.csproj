@@ -6,6 +6,11 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>SimpleLanShare</AssemblyName>
+    <Version>0.2.0</Version>
+    <Product>局域共享</Product>
+    <Description>自动配对的局域网剪贴板和文件共享工具</Description>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="..\LanShare.Core\LanShare.Core.csproj" /></ItemGroup>
+  <ItemGroup><EmbeddedResource Include="Assets\app.ico" LogicalName="LanShare.App.Icon" /></ItemGroup>
 </Project>

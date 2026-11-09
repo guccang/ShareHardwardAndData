@@ -9,41 +9,47 @@ using System.Text.Json;
 
 namespace LanShare.Core;
 
-// 共享组采用直连网状连接，每台电脑同时监听；无需固定服务器或云账号。
+// 自动发现运行本软件的设备；首次双方确认，之后依据持久证书指纹自动重连。
 public sealed class PeerNetwork : IDisposable
 {
     public const int DiscoveryPort = 42657;
     private readonly CancellationTokenSource stop = new();
     private readonly TcpListener listener;
     private readonly X509Certificate2 certificate;
-    private readonly byte[] key;
-    private readonly string code, folder, groupTag;
+    private readonly string folder;
     private readonly int port, discoveryPort;
     private readonly ConcurrentDictionary<string, Pending> pending = new();
     private readonly ConcurrentDictionary<string, PeerSession> sessions = new();
-    private readonly ConcurrentDictionary<string, byte> dialing = new();
+    private readonly ConcurrentDictionary<string, byte> dialing = new(), trusted = new(), denied = new();
+    private readonly ConcurrentDictionary<string, Lazy<Task<bool>>> approvals = new();
     private readonly SemaphoreSlim handshakes = new(12);
+    private readonly object lifecycle = new();
     private UdpClient? discovery;
     private int disposed, activeHandlers;
-    private readonly object lifecycle = new();
+    private long pairingGeneration;
     private bool credentialsDisposed;
-    public string NodeId { get; } = Guid.NewGuid().ToString("N");
+    public string NodeId { get; }
     public IReadOnlyCollection<PeerSession> Sessions => sessions.Values.ToArray();
+    public IReadOnlyCollection<string> TrustedIds => trusted.Keys.ToArray();
+    public Func<PairingRequest, CancellationToken, Task<bool>>? ConfirmPeerAsync { get; set; }
     public event Action<PeerSession>? PeerConnected;
     public event Action<PeerSession, string>? PeerDisconnected;
     public event Action<string>? Status;
 
-    // 共享码只保留在当前共享组生命周期中；自动发现只公开不可逆的组标记。
-    public PeerNetwork(string code, string folder, int port = Connector.DefaultPort, int discoveryPort = DiscoveryPort)
+    // 复制证书句柄使网络独立管理其生命周期，已信任的指纹由本机配置提供。
+    public PeerNetwork(X509Certificate2 identity, string folder, IEnumerable<string>? trustedIds = null,
+        int port = Connector.DefaultPort, int discoveryPort = DiscoveryPort)
     {
-        this.code = code; this.folder = folder; this.port = port; this.discoveryPort = discoveryPort;
-        key = Security.ParseCode(code);
-        groupTag = Convert.ToHexString(SHA256.HashData(key));
-        certificate = Security.CreateCertificate();
+        this.folder = folder; this.port = port; this.discoveryPort = discoveryPort;
+        byte[] pfx = identity.Export(X509ContentType.Pfx);
+        try { certificate = Security.ImportCertificate(pfx); }
+        finally { CryptographicOperations.ZeroMemory(pfx); }
+        NodeId = Security.Fingerprint(certificate);
+        foreach (string id in trustedIds ?? []) if (Security.IsFingerprint(id)) trusted.TryAdd(id, 0);
         listener = new TcpListener(IPAddress.Any, port);
     }
 
-    // TCP 为必需，UDP 广播不可用时仍可手动输入 IP 连接。
+    // 启用本地监听和每三秒一次的发现；广播受限时仍可输入 IP。
     public void Start(bool autoDiscovery = true)
     {
         listener.Start(16);
@@ -52,28 +58,63 @@ public sealed class PeerNetwork : IDisposable
         try
         {
             discovery = new UdpClient(new IPEndPoint(IPAddress.Any, discoveryPort)) { EnableBroadcast = true };
-            _ = Task.Run(DiscoverLoopAsync);
-            _ = Task.Run(AnnounceLoopAsync);
+            _ = Task.Run(DiscoverLoopAsync); _ = Task.Run(AnnounceLoopAsync);
         }
         catch (SocketException ex) { Status?.Invoke("自动发现不可用，可手动连接：" + ex.Message); }
     }
 
-    // 手动地址与发现地址共用连接入口，按远端身份去除重复连接。
-    public async Task ConnectAsync(string host, int remotePort = Connector.DefaultPort, CancellationToken ct = default)
+    // 手动连接允许重新尝试已拒绝设备，自动连接则保持拒绝结果避免反复弹窗。
+    public async Task ConnectAsync(string host, int remotePort = Connector.DefaultPort, CancellationToken ct = default, string? expectedId = null)
     {
-        if (sessions.Count >= 16) throw new IOException("简化版最多同时连接 16 台其他电脑。");
-        string addressKey = host + ":" + remotePort;
-        if (!dialing.TryAdd(addressKey, 0)) return;
+        if (expectedId is null) RetryPairing();
+        long generation = Interlocked.Read(ref pairingGeneration);
+        if (sessions.Count >= 16) throw new IOException("最多同时连接 16 台其他电脑。");
+        string dialKey = expectedId ?? host + ":" + remotePort;
+        if (!dialing.TryAdd(dialKey, 0)) return;
+        lock (lifecycle)
+        {
+            if (disposed != 0) { dialing.TryRemove(dialKey, out _); throw new OperationCanceledException(); }
+            activeHandlers++;
+        }
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, stop.Token);
         try
         {
-            var peer = await Connector.ConnectAsync(host, remotePort, code, folder, linked.Token, NodeId);
+            var peer = await Connector.ConnectAsync(host, remotePort, certificate, folder, ApproveAsync, linked.Token, expectedId);
             Register(peer);
         }
-        finally { dialing.TryRemove(addressKey, out _); }
+        catch (PairingRejectedException) { if (expectedId is not null && generation == Interlocked.Read(ref pairingGeneration)) denied.TryAdd(expectedId, 0); throw; }
+        finally
+        {
+            dialing.TryRemove(dialKey, out _);
+            lock (lifecycle) { activeHandlers--; ReleaseCredentials(); }
+        }
     }
 
-    // 限制并发未认证握手，避免陌生设备耗尽连接资源。
+    // 用户可显式重新发起被拒绝或超时的配对，不改变已信任设备。
+    public void RetryPairing() { Interlocked.Increment(ref pairingGeneration); denied.Clear(); approvals.Clear(); }
+
+    // 同一身份的并发连接共享一个确认结果，防止多个网卡触发重复确认窗。
+    private Task<bool> ApproveAsync(PairingRequest request, CancellationToken ct)
+    {
+        if (trusted.ContainsKey(request.PeerId)) return Task.FromResult(true);
+        if (denied.ContainsKey(request.PeerId)) return Task.FromResult(false);
+        long generation = Interlocked.Read(ref pairingGeneration);
+        return approvals.GetOrAdd(request.PeerId, _ => new Lazy<Task<bool>>(() => AskUserAsync(request, ct, generation))).Value;
+    }
+
+    // 没有确认回调时默认拒绝；超时、关闭和拒绝都不会自动信任。
+    private async Task<bool> AskUserAsync(PairingRequest request, CancellationToken ct, long generation)
+    {
+        try
+        {
+            bool accepted = ConfirmPeerAsync is not null && await ConfirmPeerAsync(request, ct).WaitAsync(ct);
+            if (!accepted && generation == Interlocked.Read(ref pairingGeneration)) denied.TryAdd(request.PeerId, 0);
+            return accepted;
+        }
+        catch (OperationCanceledException) { if (generation == Interlocked.Read(ref pairingGeneration)) denied.TryAdd(request.PeerId, 0); throw; }
+    }
+
+    // 限制未经用户确认的并发连接，后台运行避免阻塞桌面消息循环。
     private async Task AcceptLoopAsync()
     {
         try
@@ -84,67 +125,66 @@ public sealed class PeerNetwork : IDisposable
                 if (!handshakes.Wait(0)) { client.Dispose(); continue; }
                 lock (lifecycle)
                 {
-                    if (stop.IsCancellationRequested) { client.Dispose(); handshakes.Release(); break; }
+                    if (disposed != 0) { client.Dispose(); handshakes.Release(); break; }
                     activeHandlers++;
                 }
                 _ = HandleClientAsync(client);
             }
         }
-        catch (Exception ex) when (!stop.IsCancellationRequested) { Status?.Invoke("监听失败：" + ex.Message); }
-        catch (OperationCanceledException) { }
-        catch (ObjectDisposedException) { }
-        catch (SocketException) when (stop.IsCancellationRequested) { }
+        catch (Exception ex) { if (!stop.IsCancellationRequested) Status?.Invoke("监听失败：" + ex.Message); }
     }
 
-    // 已认证的数据连接必须持有待建立控制连接的随机令牌和相同节点身份。
+    // 控制连接双方同意后才登记随机令牌；文件通道还必须出示同一设备证书。
     private async Task HandleClientAsync(TcpClient client)
     {
+        long generation = Interlocked.Read(ref pairingGeneration);
         SslStream? stream = null;
         bool handedOff = false;
-        string? pendingToken = null;
+        string? pendingToken = null, peerId = null;
         Pending? waiting = null;
         try
         {
             client.NoDelay = true;
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stop.Token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(12));
-            stream = await Security.AcceptAsync(client.GetStream(), certificate, key, timeout.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
+            stream = await Security.AcceptAsync(client.GetStream(), certificate, timeout.Token);
             var hello = await Wire.ReadJsonAsync<Hello>(stream, timeout.Token);
-            if (hello.Version != 1 || string.IsNullOrWhiteSpace(hello.Name) || hello.Name.Length > 64 ||
-                !Guid.TryParseExact(hello.NodeId, "N", out _) || hello.NodeId == NodeId)
-                throw new InvalidDataException("无效的设备身份。");
+            peerId = Security.Fingerprint(stream.RemoteCertificate!);
+            if (hello.Version != 2 || string.IsNullOrWhiteSpace(hello.Name) || hello.Name.Length > 64 || hello.NodeId != peerId || peerId == NodeId)
+                throw new InvalidDataException("设备身份不匹配或版本不兼容。");
             if (hello.Channel == "bulk")
             {
-                if (!pending.TryGetValue(hello.Token, out var requested) || requested.NodeId != hello.NodeId)
-                    throw new InvalidDataException("无效的数据通道。");
+                if (!pending.TryGetValue(hello.Token, out var requested) || requested.NodeId != peerId)
+                    throw new InvalidDataException("文件通道未经过双方确认。");
                 await Wire.SendJsonAsync(stream, requested.Ready, timeout.Token);
-                if (!requested.Bulk.TrySetResult(stream)) throw new InvalidDataException("重复数据通道。");
-                stream = null; handedOff = true;
-                return;
+                if (!requested.Bulk.TrySetResult(stream)) throw new InvalidDataException("重复文件通道。");
+                stream = null; handedOff = true; return;
             }
-            if (hello.Channel != "control" || hello.Token != "" || sessions.Count >= 16 || sessions.ContainsKey(hello.NodeId))
+            if (hello.Channel != "control" || hello.Token != "" || sessions.Count >= 16 || sessions.ContainsKey(peerId))
                 throw new InvalidDataException("设备已连接或连接数达到上限。");
+            timeout.CancelAfter(TimeSpan.FromMinutes(2));
             pendingToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
             var ready = new Ready(pendingToken, Environment.MachineName, NodeId: NodeId);
-            waiting = new Pending(hello.NodeId, ready);
-            pending[pendingToken] = waiting;
             await Wire.SendJsonAsync(stream, ready, timeout.Token);
+            string address = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString();
+            await Security.ConfirmAsync(stream, new(peerId, hello.Name, address, Security.VerificationCode(NodeId, peerId)), ApproveAsync, timeout.Token);
+            waiting = new Pending(peerId, ready);
+            pending[pendingToken] = waiting;
+            await Wire.SendJsonAsync(stream, new Message("paired"), timeout.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
             var bulk = await waiting.Bulk.Task.WaitAsync(timeout.Token);
-            var peer = new PeerSession(stream, bulk, hello.Name, folder, hello.NodeId);
-            stream = null;
-            Register(peer); handedOff = true;
+            var peer = new PeerSession(stream, bulk, hello.Name, folder, peerId);
+            stream = null; Register(peer); handedOff = true;
         }
-        catch (Exception ex) when (!stop.IsCancellationRequested)
+        catch (PairingRejectedException ex)
         {
-            Status?.Invoke("连接未完成：" + ex.Message + (ex.InnerException is null ? "" : " · " + ex.InnerException.Message));
+            if (peerId is not null && generation == Interlocked.Read(ref pairingGeneration)) { denied.TryAdd(peerId, 0); approvals.TryRemove(peerId, out _); }
+            if (!stop.IsCancellationRequested) Status?.Invoke(ex.Message);
         }
-        catch (OperationCanceledException) { }
-        catch (ObjectDisposedException) { }
-        catch (IOException) when (stop.IsCancellationRequested) { }
+        catch (Exception ex) { if (!stop.IsCancellationRequested) Status?.Invoke(ex is OperationCanceledException ? "连接或确认已超时，可点击重新配对" : "连接未完成：" + ex.Message); }
         finally
         {
             if (pendingToken is not null) pending.TryRemove(pendingToken, out _);
-            // 等待结束与数据通道抵达竞态时，回收无人接管的流。
             if (waiting is not null && stream is not null)
             {
                 if (!waiting.Bulk.TrySetCanceled() && waiting.Bulk.Task.IsCompletedSuccessfully) waiting.Bulk.Task.Result.Dispose();
@@ -155,19 +195,19 @@ public sealed class PeerNetwork : IDisposable
         }
     }
 
-    // 连接注册先通知界面订阅事件，再启动数据循环。
+    // 只有完整连接成功才保存信任；确认被取消、对端拒绝和失败握手不会写入信任表。
     private void Register(PeerSession peer)
     {
         if (stop.IsCancellationRequested || !sessions.TryAdd(peer.PeerId, peer)) { peer.Dispose(); return; }
+        trusted.TryAdd(peer.PeerId, 0); approvals.TryRemove(peer.PeerId, out _);
         peer.Closed += reason =>
         {
             if (sessions.TryRemove(new KeyValuePair<string, PeerSession>(peer.PeerId, peer))) PeerDisconnected?.Invoke(peer, reason);
         };
-        PeerConnected?.Invoke(peer);
-        peer.Start();
+        PeerConnected?.Invoke(peer); peer.Start();
     }
 
-    // 各网卡分别广播，兼容有线、Wi-Fi 及多网卡环境；广播中没有剪贴板或文件内容。
+    // 发现广播只包含协议、证书指纹与端口，没有文件和剪贴板正文。
     private async Task AnnounceLoopAsync()
     {
         try
@@ -175,7 +215,7 @@ public sealed class PeerNetwork : IDisposable
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(3));
             do
             {
-                byte[] data = JsonSerializer.SerializeToUtf8Bytes(new Advertisement("SimpleLanShare/1", groupTag, NodeId, port));
+                byte[] data = JsonSerializer.SerializeToUtf8Bytes(new Advertisement("SimpleLanShare/2", NodeId, port));
                 foreach (var address in BroadcastAddresses())
                 {
                     try { await discovery!.SendAsync(data, new IPEndPoint(address, discoveryPort), stop.Token); }
@@ -183,12 +223,10 @@ public sealed class PeerNetwork : IDisposable
                 }
             } while (await timer.WaitForNextTickAsync(stop.Token));
         }
-        catch (OperationCanceledException) { }
-        catch (ObjectDisposedException) { }
         catch (Exception ex) { if (!stop.IsCancellationRequested) Status?.Invoke("广播停止：" + ex.Message); }
     }
 
-    // 仅节点 ID 较小的一端主动连接，避免自动发现产生两条相反方向的连接。
+    // 身份较小的一方发起连接，阻止两边同时自动配对；身份必须与实际 TLS 证书吻合。
     private async Task DiscoverLoopAsync()
     {
         try
@@ -200,26 +238,23 @@ public sealed class PeerNetwork : IDisposable
                 Advertisement? advertised;
                 try { advertised = JsonSerializer.Deserialize<Advertisement>(packet.Buffer); }
                 catch (JsonException) { continue; }
-                if (advertised is null || advertised.Protocol != "SimpleLanShare/1" || advertised.Group != groupTag ||
-                    !Guid.TryParseExact(advertised.NodeId, "N", out _) || advertised.Port is < 1 or > 65535 ||
-                    string.CompareOrdinal(NodeId, advertised.NodeId) >= 0 || sessions.ContainsKey(advertised.NodeId)) continue;
-                _ = TryDiscoverConnectAsync(packet.RemoteEndPoint.Address.ToString(), advertised.Port);
+                if (advertised is null || advertised.Protocol != "SimpleLanShare/2" || !Security.IsFingerprint(advertised.NodeId) ||
+                    advertised.Port is < 1 or > 65535 || string.CompareOrdinal(NodeId, advertised.NodeId) >= 0 ||
+                    sessions.ContainsKey(advertised.NodeId) || denied.ContainsKey(advertised.NodeId)) continue;
+                _ = TryDiscoverConnectAsync(packet.RemoteEndPoint.Address.ToString(), advertised.Port, advertised.NodeId);
             }
         }
-        catch (OperationCanceledException) { }
-        catch (ObjectDisposedException) { }
         catch (Exception ex) { if (!stop.IsCancellationRequested) Status?.Invoke("自动发现停止：" + ex.Message); }
     }
 
-    // 自动发现失败允许下一轮广播重试，手动连接则直接向界面返回错误。
-    private async Task TryDiscoverConnectAsync(string host, int remotePort)
+    // 网络暂时不通时下一轮继续尝试；明确拒绝的设备在本轮共享期间不重复打扰。
+    private async Task TryDiscoverConnectAsync(string host, int remotePort, string expectedId)
     {
-        try { await ConnectAsync(host, remotePort); }
-        catch (Exception ex) when (!stop.IsCancellationRequested) { Status?.Invoke("自动连接失败：" + ex.Message); }
-        catch (OperationCanceledException) { }
+        try { await ConnectAsync(host, remotePort, expectedId: expectedId); }
+        catch (Exception ex) { if (!stop.IsCancellationRequested) Status?.Invoke("自动连接：" + ex.Message); }
     }
 
-    // 从活动 IPv4 网卡计算定向广播地址，同时发送通用广播。
+    // 为所有活动 IPv4 网卡计算广播地址，兼容有线与 Wi-Fi 并存。
     private static IEnumerable<IPAddress> BroadcastAddresses()
     {
         var addresses = new HashSet<IPAddress> { IPAddress.Broadcast };
@@ -233,7 +268,7 @@ public sealed class PeerNetwork : IDisposable
         return addresses;
     }
 
-    // 停止共享时关闭监听、发现与所有已认证会话。
+    // 停止所有网络和确认等待，已信任设备由调用者保存在本机设置。
     public void Dispose()
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
@@ -242,14 +277,14 @@ public sealed class PeerNetwork : IDisposable
         lock (lifecycle) ReleaseCredentials();
     }
 
-    // 等待所有使用证书的握手退出后释放临时用户密钥。
+    // 等待握手结束后释放原生证书句柄，避免取消过程访问已释放密钥。
     private void ReleaseCredentials()
     {
         if (disposed == 0 || activeHandlers != 0 || credentialsDisposed) return;
-        credentialsDisposed = true; certificate.Dispose(); CryptographicOperations.ZeroMemory(key);
+        credentialsDisposed = true; certificate.Dispose();
     }
 
-    private sealed record Advertisement(string Protocol, string Group, string NodeId, int Port);
+    private sealed record Advertisement(string Protocol, string NodeId, int Port);
     private sealed record Pending(string NodeId, Ready Ready)
     {
         public TaskCompletionSource<SslStream> Bulk { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
