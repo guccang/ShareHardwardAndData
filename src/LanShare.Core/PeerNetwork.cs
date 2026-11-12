@@ -152,19 +152,21 @@ public sealed class PeerNetwork : IDisposable
             peerId = Security.Fingerprint(stream.RemoteCertificate!);
             if (hello.Version != 2 || string.IsNullOrWhiteSpace(hello.Name) || hello.Name.Length > 64 || hello.NodeId != peerId || peerId == NodeId)
                 throw new InvalidDataException("设备身份不匹配或版本不兼容。");
-            if (hello.Channel == "bulk")
+            if (hello.Channel is "bulk" or "input")
             {
                 if (!pending.TryGetValue(hello.Token, out var requested) || requested.NodeId != peerId)
                     throw new InvalidDataException("文件通道未经过双方确认。");
+                if (hello.Channel == "input" && requested.Ready.InputVersion != 1) throw new InvalidDataException("未协商键鼠通道。");
+                var channel = hello.Channel == "input" ? requested.Input : requested.Bulk;
                 await Wire.SendJsonAsync(stream, requested.Ready, timeout.Token);
-                if (!requested.Bulk.TrySetResult(stream)) throw new InvalidDataException("重复文件通道。");
+                if (!channel.TrySetResult(stream)) throw new InvalidDataException("重复数据通道。");
                 stream = null; handedOff = true; return;
             }
             if (hello.Channel != "control" || hello.Token != "" || sessions.Count >= 16 || sessions.ContainsKey(peerId))
                 throw new InvalidDataException("设备已连接或连接数达到上限。");
             timeout.CancelAfter(TimeSpan.FromMinutes(2));
             pendingToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
-            var ready = new Ready(pendingToken, Environment.MachineName, NodeId: NodeId);
+            var ready = new Ready(pendingToken, Environment.MachineName, NodeId: NodeId, InputVersion: hello.InputVersion == 1 ? 1 : 0);
             await Wire.SendJsonAsync(stream, ready, timeout.Token);
             string address = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString();
             await Security.ConfirmAsync(stream, new(peerId, hello.Name, address, Security.VerificationCode(NodeId, peerId)), ApproveAsync, timeout.Token);
@@ -173,7 +175,8 @@ public sealed class PeerNetwork : IDisposable
             await Wire.SendJsonAsync(stream, new Message("paired"), timeout.Token);
             timeout.CancelAfter(TimeSpan.FromSeconds(15));
             var bulk = await waiting.Bulk.Task.WaitAsync(timeout.Token);
-            var peer = new PeerSession(stream, bulk, hello.Name, folder, peerId);
+            var input = ready.InputVersion == 1 ? await waiting.Input.Task.WaitAsync(timeout.Token) : null;
+            var peer = new PeerSession(stream, bulk, hello.Name, folder, peerId, input);
             stream = null; Register(peer); handedOff = true;
         }
         catch (PairingRejectedException ex)
@@ -188,6 +191,7 @@ public sealed class PeerNetwork : IDisposable
             if (waiting is not null && stream is not null)
             {
                 if (!waiting.Bulk.TrySetCanceled() && waiting.Bulk.Task.IsCompletedSuccessfully) waiting.Bulk.Task.Result.Dispose();
+                if (!waiting.Input.TrySetCanceled() && waiting.Input.Task.IsCompletedSuccessfully) waiting.Input.Task.Result.Dispose();
             }
             if (!handedOff) { stream?.Dispose(); client.Dispose(); }
             handshakes.Release();
@@ -288,5 +292,6 @@ public sealed class PeerNetwork : IDisposable
     private sealed record Pending(string NodeId, Ready Ready)
     {
         public TaskCompletionSource<SslStream> Bulk { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<SslStream> Input { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }

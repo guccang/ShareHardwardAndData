@@ -18,10 +18,12 @@ internal static class Program
         try
         {
             await ProtocolTestsAsync();
+            InputTests.Run(Check);
             await PairingTestsAsync(root);
+            await LegacyInputNegotiationAsync(root);
             await ThreePeerTestsAsync(root);
             await DiscoveryTestsAsync(root);
-            Console.WriteLine($"PASS: {assertions} assertions; framing, authentication, three peers, clipboard, files, cancellation.");
+            Console.WriteLine($"PASS: {assertions} assertions; framing, authentication, three peers, clipboard, files, cancellation, shared input.");
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
@@ -87,6 +89,11 @@ internal static class Program
         await restoredA.ConnectAsync("127.0.0.1", portB);
         await UntilAsync(() => restoredB.Sessions.Count == 1);
         Check(prompts == 0 && restoredA.Sessions.Count == 1, "persisted trust reconnects without prompts");
+        var inputEvent = new TaskCompletionSource<InputPacket>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var inputSender = restoredA.Sessions.Single().Input!;
+        restoredB.Sessions.Single().Input!.Received = packet => { inputEvent.TrySetResult(packet); return Task.CompletedTask; };
+        var wheel = new InputPacket(InputOp.Wheel, Guid.NewGuid(), -120, 1);
+        Check(inputSender.TrySend(wheel) && await inputEvent.Task.WaitAsync(TimeSpan.FromSeconds(5)) == wheel, "independent certificate-bound input stream roundtrip");
 
         using var strangerIdentity = Security.CreateCertificate();
         using var stranger = new PeerNetwork(strangerIdentity, root, port: FreePort());
@@ -150,6 +157,33 @@ internal static class Program
         await ThrowsAsync<OperationCanceledException>(() => cancelled, "cancelling pending pairing closes the handshake");
         Check(cancelA.TrustedIds.Count == 0 && waiting.TrustedIds.Count == 0 && waiting.Sessions.Count == 0, "cancelled pairing has no trust or data access");
     }
+    // 旧版握手不含键鼠能力字段，仍可只建立原来的两条 TLS 通道。
+    private static async Task LegacyInputNegotiationAsync(string root)
+    {
+        using var serverId = Security.CreateCertificate(); using var oldId = Security.CreateCertificate();
+        string oldFingerprint = Security.Fingerprint(oldId);
+        int port = FreePort();
+        using var server = new PeerNetwork(serverId, root, [oldFingerprint], port);
+        server.Start(false);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var ct = timeout.Token;
+        using var controlClient = new TcpClient(); await controlClient.ConnectAsync(IPAddress.Loopback, port, ct);
+        using var control = await Security.ConnectAsync(controlClient.GetStream(), oldId, ct);
+        await Wire.SendJsonAsync(control, new { Channel = "control", Token = "", Name = "旧版电脑", Version = 2, NodeId = oldFingerprint }, ct);
+        var ready = await Wire.ReadJsonAsync<Ready>(control, ct);
+        await Security.ConfirmAsync(control, new(server.NodeId, ready.Name, "127.0.0.1", ""), (_, _) => Task.FromResult(true), ct);
+        Check((await Wire.ReadJsonAsync<Message>(control, ct)).Kind == "paired" && ready.InputVersion == 0, "old handshake negotiates data sharing only");
+        using var bulkClient = new TcpClient(); await bulkClient.ConnectAsync(IPAddress.Loopback, port, ct);
+        using var bulk = await Security.ConnectAsync(bulkClient.GetStream(), oldId, ct);
+        await Wire.SendJsonAsync(bulk, new { Channel = "bulk", ready.Token, Name = "旧版电脑", Version = 2, NodeId = oldFingerprint }, ct);
+        await Wire.ReadJsonAsync<Ready>(bulk, ct);
+        using var old = new PeerSession(control, bulk, ready.Name, root, server.NodeId);
+        old.Start(); await UntilAsync(() => server.Sessions.Count == 1);
+        var peer = server.Sessions.Single(); var clip = NextClipboard(peer);
+        await old.SendClipboardAsync(new("text", [65]), ct);
+        Check(peer.Input == null && (await clip.WaitAsync(ct)).Data.SequenceEqual(new byte[] { 65 }), "older peer shares clipboard without opening an input stream");
+    }
+
     // 三个实例模拟三台电脑，使用回环网络的真实加密连接进行双向验证。
     private static async Task ThreePeerTestsAsync(string root)
     {
@@ -220,6 +254,10 @@ internal static class Program
         var duringFile = NextClipboard(ba);
         await ab.SendClipboardAsync(new("text", text)).WaitAsync(TimeSpan.FromSeconds(5));
         Check((await duringFile.WaitAsync(TimeSpan.FromSeconds(5))).Data.SequenceEqual(text), "clipboard bypasses blocked file channel");
+        var duringInput = new TaskCompletionSource<InputPacket>(TaskCreationOptions.RunContinuationsAsynchronously);
+        ba.Input!.Received = p => { duringInput.TrySetResult(p); return Task.CompletedTask; };
+        var key = new InputPacket(InputOp.Key, Guid.NewGuid(), 65, 30);
+        Check(ab.Input!.TrySend(key) && await duringInput.Task.WaitAsync(TimeSpan.FromSeconds(5)) == key, "input bypasses blocked file channel");
         ab.Close("test cancellation");
         await ThrowsAsync<Exception>(() => interrupted, "disconnect cancels pending receive decision");
         await UntilAsync(() => a.Sessions.Count == 1 && b.Sessions.Count == 1);

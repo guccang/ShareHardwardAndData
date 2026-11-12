@@ -12,11 +12,11 @@ internal sealed partial class MainForm
     private readonly Label recordingClock = new();
     private readonly Label screenshotMessage = new() { Text = "截图后可在这里查看操作结果。" };
     private readonly Label recordingMessage = new() { Text = "尚未录制。框选后自动开始，停止后自动保存。" };
-    private readonly string[] pageNames = ["文件共享", "截图", "录屏", "设置", "活动记录"];
+    private readonly string[] pageNames = ["文件共享", "截图", "录屏", "设置", "活动记录", "键鼠共享"];
     private readonly string[] pageDescriptions =
     [
         "把文件送到自己的另一台电脑。", "选取画面，复制到剪贴板。", "框选后直接录制，结束后自动保存。",
-        "管理连接、接收目录和后台运行。", "查看连接状态、文件进度和最近操作。"
+        "管理连接、接收目录和后台运行。", "查看连接状态、文件进度和最近操作。", "按桌面上的左右顺序排列电脑，鼠标跨屏后键盘一起切换。"
     ];
     private static readonly Color Accent = Color.FromArgb(17, 112, 103);
     private static readonly Color Muted = Color.FromArgb(91, 110, 117);
@@ -28,9 +28,9 @@ internal sealed partial class MainForm
         shell.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 184));
         shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         Controls.Add(shell);
-        var sidebar = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(227, 239, 235), Padding = new Padding(18, 26, 18, 20), ColumnCount = 1, RowCount = 8, Margin = Padding.Empty };
+        var sidebar = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(227, 239, 235), Padding = new Padding(18, 26, 18, 20), ColumnCount = 1, RowCount = pageNames.Length + 3, Margin = Padding.Empty };
         sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 98));
-        for (int i = 0; i < 5; i++) sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        foreach (var name in pageNames) sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
         sidebar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 66));
         var brand = Rows(42, -1);
@@ -45,7 +45,7 @@ internal sealed partial class MainForm
             button.Click += (_, _) => SelectPage(index);
             navigation.Add(button); sidebar.Controls.Add(button, 0, i + 1);
         }
-        sidebar.Controls.Add(new Label { Text = "本机\n" + Environment.MachineName, Dock = DockStyle.Fill, ForeColor = Muted, TextAlign = ContentAlignment.BottomLeft }, 0, 7);
+        sidebar.Controls.Add(new Label { Text = "本机\n" + Environment.MachineName, Dock = DockStyle.Fill, ForeColor = Muted, TextAlign = ContentAlignment.BottomLeft }, 0, pageNames.Length + 2);
         shell.Controls.Add(sidebar, 0, 0);
 
         var workspace = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(28, 20, 28, 12), ColumnCount = 1, RowCount = 3, Margin = Padding.Empty };
@@ -63,7 +63,7 @@ internal sealed partial class MainForm
         workspace.Controls.Add(heading, 0, 0);
 
         var hostPanel = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty };
-        pages.AddRange([BuildSharePage(), BuildScreenshotPage(), BuildRecordingPage(), BuildSettingsPage(), BuildActivityPage()]);
+        pages.AddRange([BuildSharePage(), BuildScreenshotPage(), BuildRecordingPage(), BuildSettingsPage(), BuildActivityPage(), BuildInputPage()]);
         foreach (var page in pages) { page.Dock = DockStyle.Fill; hostPanel.Controls.Add(page); }
         workspace.Controls.Add(hostPanel, 0, 1);
         var status = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Padding = new Padding(0, 10, 0, 0), Margin = Padding.Empty };

@@ -64,20 +64,22 @@ internal sealed partial class MainForm : Form
         recordingHotkey = new ScreenshotHotkey((Keys)settings.RecordingShortcut, !smoke, "录屏", Keys.Control | Keys.Alt | Keys.R);
         recording.ShortcutLabel = recordingHotkey.Label;
         startup.Checked = settings.LaunchAtLogin;
+        InitializeInput();
         BuildLayout();
         clipboard = new ClipboardBridge();
         clipboard.Changed += content => { latestClipboard = content; _ = BroadcastClipboardAsync(); };
         clipboard.Notice += text => { detail.Text = text; };
         startup.CheckedChanged += (_, _) => ChangeStartupSetting();
         captureButton.Click += async (_, _) => await CaptureScreenshotAsync();
-        screenshotHotkey.Pressed += async () => await CaptureScreenshotAsync();
+        screenshotHotkey.Pressed += async () => { if (inputRouter.Mode != ControlMode.Sending) await CaptureScreenshotAsync(); };
         recordButton.Click += async (_, _) => await ToggleRecordingAsync();
-        recordingHotkey.Pressed += async () => await ToggleRecordingAsync();
+        recordingHotkey.Pressed += async () => { if (inputRouter.Mode != ControlMode.Sending) await ToggleRecordingAsync(); };
         recording.Changed += RefreshRecordingState;
         recording.Notice += text => { Log("录屏", text); recordingMessage.Text = text; if (!shuttingDown && !recording.IsRecording) tray.ShowBalloonTip(4000, "区域录屏", text, text.Contains("失败") ? ToolTipIcon.Warning : ToolTipIcon.Info); };
         recordingTimer.Tick += (_, _) => RefreshRecordingState();
         Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
         Microsoft.Win32.SystemEvents.DisplaySettingsChanging += OnDisplaySettingsChanging;
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
         screenshots.Notice += text => { Log("截图", text); screenshotMessage.Text = text; if (!Visible && (text.Contains("失败") || text.Contains("占用"))) tray.ShowBalloonTip(3000, "截图", text, ToolTipIcon.Warning); };
         start.Click += (_, _) => ToggleSharing();
         browse.Click += (_, _) => ChooseFolder();
@@ -88,6 +90,7 @@ internal sealed partial class MainForm : Form
         tray.DoubleClick += (_, _) => RestoreWindow();
         var trayMenu = new ContextMenuStrip();
         trayMenu.Items.Add("打开局域共享", null, (_, _) => RestoreWindow());
+        trayMenu.Items.Add("键鼠返回本机", null, (_, _) => inputRouter.ReturnLocal("已从托盘返回本机"));
         var captureItem = trayMenu.Items.Add("截图", null, async (_, _) => await CaptureScreenshotAsync());
         var lastItem = trayMenu.Items.Add("查看 / 保存上次截图", null, (_, _) => screenshots.ShowLast());
         trayMenu.Items.Add("截图快捷键…", null, (_, _) => ConfigureScreenshot());
@@ -237,11 +240,26 @@ internal sealed partial class MainForm : Form
     // 锁屏后停止并保存，解锁不会自动继续录制。
     private void OnSessionSwitch(object sender, Microsoft.Win32.SessionSwitchEventArgs e)
     {
-        if (e.Reason == Microsoft.Win32.SessionSwitchReason.SessionLock) Ui(() => { if (recording.IsRecording) _ = recording.StopAsync(); });
+        Ui(() =>
+        {
+            if (e.Reason is Microsoft.Win32.SessionSwitchReason.SessionLock or Microsoft.Win32.SessionSwitchReason.ConsoleDisconnect or Microsoft.Win32.SessionSwitchReason.RemoteDisconnect)
+            {
+                inputLocked = true;
+                SetInputRuntime();
+                if (recording.IsRecording) _ = recording.StopAsync();
+            }
+            else if (e.Reason is Microsoft.Win32.SessionSwitchReason.SessionUnlock or Microsoft.Win32.SessionSwitchReason.ConsoleConnect or Microsoft.Win32.SessionSwitchReason.RemoteConnect)
+            {
+                inputLocked = false; SetInputRuntime();
+            }
+        });
     }
 
     // 显示器布局改变后原坐标可能失效，及时停止，避免录到选区之外的屏幕内容。
-    private void OnDisplaySettingsChanging(object? sender, EventArgs e) => Ui(() => { if (recording.IsRecording) _ = recording.StopAsync(); });
+    private void OnDisplaySettingsChanging(object? sender, EventArgs e) => Ui(() => { inputRouter.ReturnLocal("显示器布局改变"); if (recording.IsRecording) _ = recording.StopAsync(); });
+
+    // 系统完成显示器调整后重新读取虚拟桌面边界。
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e) => Ui(SetInputRuntime);
 
     // 明确退出先完成视频索引，再进入原有资源释放路径。
     private async Task FinishRecordingAndExitAsync()
@@ -280,9 +298,10 @@ internal sealed partial class MainForm : Form
             network = current;
             current.Status += text => Ui(() => { if (network == current) Log("连接", text); });
             current.PeerConnected += peer => AttachPeer(current, peer);
-            current.PeerDisconnected += (peer, reason) => Ui(() => { if (network == current) { RefreshPeers(); Log(peer.PeerName, "已断开：" + reason); } });
+            current.PeerDisconnected += (peer, reason) => Ui(() => { if (network == current) { DetachInput(peer); RefreshPeers(); Log(peer.PeerName, "已断开：" + reason); } });
             current.ConfirmPeerAsync = (request, ct) => ConfirmPeerAsync(current, request, ct);
             current.Start();
+            SetInputRuntime();
             clipboard.Enabled = sync.Checked;
             browse.Enabled = false; start.Text = "停止共享";
             tray.Text = "局域共享 · 已开启";
@@ -296,6 +315,7 @@ internal sealed partial class MainForm : Form
     // 所有旧会话回调都用所属网络实例过滤，避免重启共享后旧消息污染新状态。
     private void AttachPeer(PeerNetwork current, PeerSession peer)
     {
+        BindInput(current, peer);
         peer.ClipboardReceived += content => Ui(() => { if (network == current && peer.IsConnected) clipboard.Receive(content); });
         peer.FileReceived += path => Ui(() =>
         {
@@ -311,6 +331,7 @@ internal sealed partial class MainForm : Form
         {
             if (network != current) return;
             settings.TrustedDeviceIds = current.TrustedIds.ToList();
+            RememberInputPeer(peer);
             try { settings.Save(); } catch (Exception ex) { Log("保存信任失败", ex.Message); }
             RefreshPeers(); Log(peer.PeerName, "已连接并记住此设备，下次自动连接");
         });
@@ -354,6 +375,7 @@ internal sealed partial class MainForm : Form
     {
         if (MessageBox.Show(this, "清除已确认的设备并停止共享？下次连接需要重新确认。", "清除信任", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         StopSharing(); settings.TrustedDeviceIds.Clear();
+        settings.InputAllowed.Clear(); settings.InputOrder.Clear(); settings.InputNames.Clear(); RefreshInputCards();
         try { settings.Save(); Log("配对", "已清除信任，点击开启共享可重新配对"); }
         catch (Exception ex) { Log("设置保存失败", ex.Message); }
     }
@@ -527,6 +549,7 @@ internal sealed partial class MainForm : Form
     private void StopSharing()
     {
         var previous = network; network = null;
+        SetInputRuntime(); inputPeers.Clear(); RefreshInputCards();
         if (previous is not null) settings.TrustedDeviceIds = previous.TrustedIds.ToList();
         clipboard.Enabled = false; latestClipboard = null; previous?.Dispose();
         browse.Enabled = true; start.Text = "开启共享"; tray.Text = "局域共享 · 未开启";
@@ -566,8 +589,10 @@ internal sealed partial class MainForm : Form
         }
         Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
         Microsoft.Win32.SystemEvents.DisplaySettingsChanging -= OnDisplaySettingsChanging;
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         recordingTimer.Dispose(); recording.Dispose();
         screenshotHotkey.Dispose(); recordingHotkey.Dispose(); screenshots.Dispose(); StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
+        inputTimer.Dispose(); inputDesktop.Dispose();
         base.OnFormClosing(e);
     }
 

@@ -20,6 +20,12 @@ internal static class AppSelfTest
         using var restoredIdentity = restored.ReadIdentity();
         if (Security.Fingerprint(identity) != Security.Fingerprint(restoredIdentity)) throw new Exception("Identity persistence failed");
         lines.Add("PASS: DPAPI-protected identity survives settings roundtrip");
+        using (var input = new WindowsInput())
+        {
+            input.Start(); input.Dispose(); input.Start();
+            if (input.Width < 1 || input.Height < 1) throw new Exception("Invalid input desktop extent");
+        }
+        lines.Add("PASS: Windows keyboard and mouse hooks install, release and reinstall without injecting input");
         using var bitmap = new Bitmap(8, 8);
         bitmap.SetPixel(3, 4, Color.FromArgb(128, 20, 100, 200));
         using var memory = new MemoryStream(); bitmap.Save(memory, ImageFormat.Png);
@@ -35,7 +41,7 @@ internal static class AppSelfTest
         lines.Add("PASS: oversized PNG rejected before GDI+ decode");
         using var form = new MainForm(true);
         form.SavePreview(Path.ChangeExtension(report, ".png"));
-        for (int page = 1; page < 5; page++) form.SavePreview(Path.Combine(Path.GetDirectoryName(report)!, $"page-{page}.png"), page);
+        for (int page = 1; page < 6; page++) form.SavePreview(Path.Combine(Path.GetDirectoryName(report)!, $"page-{page}.png"), page);
         form.Close(); Application.DoEvents();
         if (form.IsDisposed || form.Visible) throw new Exception("Close must hide to tray without disposal");
         lines.Add("PASS: window close keeps application alive in tray");

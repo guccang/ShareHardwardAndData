@@ -16,6 +16,11 @@ internal sealed class AppSettings
     public bool ClipboardEnabled { get; set; } = true;
     public bool AutoAccept { get; set; } = true;
     public bool LaunchAtLogin { get; set; } = true;
+    public bool InputEnabled { get; set; }
+    public List<string> InputOrder { get; set; } = [];
+    public List<string> InputAllowed { get; set; } = [];
+    public Dictionary<string, string> InputNames { get; set; } = [];
+    public Keys InputReturnKey { get; set; } = Keys.Home;
     public int ScreenshotShortcut { get; set; } = (int)ScreenshotHotkey.DefaultShortcut;
     public int RecordingShortcut { get; set; } = (int)(Keys.Control | Keys.Alt | Keys.R);
     private static readonly string FilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SimpleLanShare", "settings.json");
@@ -39,6 +44,8 @@ internal sealed class AppSettings
     public X509Certificate2 ReadIdentity()
     {
         TrustedDeviceIds ??= [];
+        InputAllowed ??= []; InputOrder ??= []; InputNames ??= [];
+        InputAllowed.RemoveAll(id => !TrustedDeviceIds.Contains(id));
         try
         {
             if (!string.IsNullOrEmpty(ProtectedIdentity))
@@ -55,6 +62,7 @@ internal sealed class AppSettings
         }
         catch (Exception ex) when (ex is CryptographicException or FormatException or System.ComponentModel.Win32Exception) { }
         TrustedDeviceIds.Clear();
+        InputAllowed.Clear(); InputOrder.Clear(); InputNames.Clear();
         var fresh = Security.CreateCertificate();
         byte[] pfx = fresh.Export(X509ContentType.Pfx);
         try { ProtectedIdentity = Protect(Convert.ToBase64String(pfx), false); }

@@ -49,8 +49,8 @@ public static class Wire
 
 // 不同帧类型共享不可变传输容器。
 public sealed record Frame(byte Kind, byte[] Data);
-public sealed record Hello(string Channel, string Token, string Name, int Version = 2, string NodeId = "");
-public sealed record Ready(string Token, string Name, int Version = 2, string NodeId = "");
+public sealed record Hello(string Channel, string Token, string Name, int Version = 2, string NodeId = "", int InputVersion = 0);
+public sealed record Ready(string Token, string Name, int Version = 2, string NodeId = "", int InputVersion = 0);
 public sealed record Message(string Kind, string Id = "", string Text = "", long Size = 0, string Hash = "");
 public sealed record ClipboardContent(string Format, byte[] Data);
 public sealed record FileOffer(string Id, string Name, long Size);

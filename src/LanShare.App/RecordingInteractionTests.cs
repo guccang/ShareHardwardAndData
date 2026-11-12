@@ -56,6 +56,7 @@ internal static class RecordingInteractionTests
         using var timer = new System.Windows.Forms.Timer { Interval = 350 };
         Exception? failure = null;
         bool controlsShown = false;
+        int baselineAttempts = 0;
         pattern.Shown += (_, _) => timer.Start();
         timer.Tick += (_, _) =>
         {
@@ -74,12 +75,20 @@ internal static class RecordingInteractionTests
                 }
                 if (!controlsShown)
                 {
+                    // 后台 Windows 会话有时返回全黑图像而非异常，先确认能读到测试窗口。
+                    Color baseline = frame.GetPixel(50, 40);
+                    if (baseline.G <= 240 || baseline.R >= 15 || baseline.B >= 15)
+                    {
+                        if (++baselineAttempts < 3) { pattern.Refresh(); timer.Start(); return; }
+                        results.Add($"SKIP: synthetic green test window unavailable before showing overlay (RGB {baseline.R},{baseline.G},{baseline.B})");
+                        return;
+                    }
                     overlay.ShowControls();
                     overlay.Toolbar.Location = new Point(pattern.Left + 20, pattern.Top + 20);
                     controlsShown = true; timer.Start(); return;
                 }
                 Color pixel = frame.GetPixel(50, 40);
-                Assert(pixel.G > 240 && pixel.R < 15 && pixel.B < 15, "GDI capture omits floating controls and keeps underlying pixels", results);
+                Assert(pixel.G > 240 && pixel.R < 15 && pixel.B < 15, $"GDI capture omits floating controls and keeps underlying pixels (RGB {pixel.R},{pixel.G},{pixel.B})", results);
                 frame.Save(Path.Combine(directory, "overlay-exclusion-test.png"));
             }
             catch (Exception ex) { failure = ex; }

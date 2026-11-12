@@ -17,6 +17,7 @@ public sealed class PeerSession : IDisposable
     private int closed, started;
     public string PeerName { get; }
     public string PeerId { get; }
+    public InputLink? Input { get; }
     public string ReceiveFolder { get; }
     public bool IsConnected => Volatile.Read(ref closed) == 0;
     public event Action<ClipboardContent>? ClipboardReceived;
@@ -27,9 +28,10 @@ public sealed class PeerSession : IDisposable
     public Func<FileOffer, CancellationToken, Task<bool>>? ConfirmFileAsync { get; set; }
 
     // 接收目录在会话建立时固定，避免传输过程中切换目录。
-    public PeerSession(Stream control, Stream bulk, string peerName, string folder, string peerId = "")
+    public PeerSession(Stream control, Stream bulk, string peerName, string folder, string peerId = "", Stream? input = null)
     {
         this.control = control; this.bulk = bulk;
+        Input = input is null ? null : new InputLink(input);
         PeerName = peerName; PeerId = peerId;
         ReceiveFolder = Path.GetFullPath(folder);
     }
@@ -38,6 +40,7 @@ public sealed class PeerSession : IDisposable
     public void Start()
     {
         if (Interlocked.Exchange(ref started, 1) != 0) return;
+        Input?.Start();
         _ = Task.Run(() => GuardAsync(ReadControlAsync));
         _ = Task.Run(() => GuardAsync(ReadBulkAsync));
         _ = Task.Run(() => GuardAsync(HeartbeatAsync));
@@ -262,7 +265,7 @@ public sealed class PeerSession : IDisposable
     public void Close(string reason)
     {
         if (Interlocked.Exchange(ref closed, 1) != 0) return;
-        stop.Cancel(); control.Dispose(); bulk.Dispose();
+        stop.Cancel(); Input?.Dispose(); control.Dispose(); bulk.Dispose();
         foreach (var reply in replies.Values) reply.TrySetCanceled();
         Closed?.Invoke(reason);
     }
