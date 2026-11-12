@@ -128,8 +128,22 @@ internal static class UpdatePackage
     {
         if (!IsStage(stage) || !Directory.Exists(stage) || File.GetAttributes(stage).HasFlag(FileAttributes.ReparsePoint)) return;
         foreach (var name in Files)
-            foreach (var suffix in new[] { "", ".new", ".bak" }) File.Delete(Path.Combine(stage, name + suffix));
+            foreach (var suffix in new[] { "", ".new", ".bak" }) DeleteStagedFile(Path.Combine(stage, name + suffix));
         Directory.Delete(stage);
+    }
+
+    // 刚启动新版后，Windows 有时仍短暂占用暂存 EXE；只重试访问冲突，超时则保留文件。
+    private static void DeleteStagedFile(string path)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try { File.Delete(path); return; }
+            catch (Exception ex) when (attempt < 20 && (ex is IOException or UnauthorizedAccessException)
+                && (ex.HResult & 0xffff) is 5 or 32 or 33)
+            {
+                Thread.Sleep(200);
+            }
+        }
     }
 
     // 暂存目录必须带固定前缀和独立的事务编号。
