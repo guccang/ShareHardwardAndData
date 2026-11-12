@@ -71,9 +71,9 @@ internal sealed partial class MainForm : Form
         clipboard.Notice += text => { detail.Text = text; };
         startup.CheckedChanged += (_, _) => ChangeStartupSetting();
         captureButton.Click += async (_, _) => await CaptureScreenshotAsync();
-        screenshotHotkey.Pressed += async () => { if (inputRouter.Mode != ControlMode.Sending) await CaptureScreenshotAsync(); };
+        screenshotHotkey.Pressed += async () => { if (input.Current.Mode != ControlMode.Sending) await CaptureScreenshotAsync(); };
         recordButton.Click += async (_, _) => await ToggleRecordingAsync();
-        recordingHotkey.Pressed += async () => { if (inputRouter.Mode != ControlMode.Sending) await ToggleRecordingAsync(); };
+        recordingHotkey.Pressed += async () => { if (input.Current.Mode != ControlMode.Sending) await ToggleRecordingAsync(); };
         recording.Changed += RefreshRecordingState;
         recording.Notice += text => { Log("录屏", text); recordingMessage.Text = text; if (!shuttingDown && !recording.IsRecording) tray.ShowBalloonTip(4000, "区域录屏", text, text.Contains("失败") ? ToolTipIcon.Warning : ToolTipIcon.Info); };
         recordingTimer.Tick += (_, _) => RefreshRecordingState();
@@ -90,7 +90,7 @@ internal sealed partial class MainForm : Form
         tray.DoubleClick += (_, _) => RestoreWindow();
         var trayMenu = new ContextMenuStrip();
         trayMenu.Items.Add("打开局域共享", null, (_, _) => RestoreWindow());
-        trayMenu.Items.Add("键鼠返回本机", null, (_, _) => inputRouter.ReturnLocal("已从托盘返回本机"));
+        trayMenu.Items.Add("键鼠返回本机", null, (_, _) => input.ReturnLocal("已从托盘返回本机"));
         var captureItem = trayMenu.Items.Add("截图", null, async (_, _) => await CaptureScreenshotAsync());
         var lastItem = trayMenu.Items.Add("查看 / 保存上次截图", null, (_, _) => screenshots.ShowLast());
         trayMenu.Items.Add("截图快捷键…", null, (_, _) => ConfigureScreenshot());
@@ -111,7 +111,6 @@ internal sealed partial class MainForm : Form
         };
         trayMenu.Items.Add("退出", null, (_, _) => ExitApplication());
         tray.ContextMenuStrip = trayMenu;
-        Resize += (_, _) => { if (WindowState == FormWindowState.Minimized && !smoke) Hide(); };
         RefreshPeers();
         UpdateState("自动发现 · 首次连接需要双方确认", "各台电脑打开软件即可；确认过的设备下次自动连接，无需共享码。");
         RefreshShortcutLabels();
@@ -170,8 +169,9 @@ internal sealed partial class MainForm : Form
         if (shuttingDown || screenshots.IsCapturing || shortcutSettingsOpen || recording.IsBusy) return;
         bool restore = Visible;
         if (restore) Hide();
+        selectingForCapture = true;
         try { await screenshots.CaptureAsync(); }
-        finally { if (restore && !shuttingDown && !IsDisposed) RestoreWindow(); }
+        finally { selectingForCapture = false; if (restore && !shuttingDown && !IsDisposed) RestoreWindow(); }
     }
 
     // 快捷键保存失败时回滚配置，热键窗口会保留原先的有效组合。
@@ -223,6 +223,7 @@ internal sealed partial class MainForm : Form
     private void RefreshRecordingState()
     {
         if (IsDisposed) return;
+        selectingForCapture = screenshots.IsCapturing || (recording.IsBusy && !recording.IsRecording);
         recordButton.Text = recording.IsStopping ? "正在保存…" : recording.IsBusy ? "停止并保存" : "开始录屏";
         recordButton.Enabled = !shuttingDown && !recording.IsStopping;
         captureButton.Enabled = !recording.IsBusy;
@@ -256,7 +257,7 @@ internal sealed partial class MainForm : Form
     }
 
     // 显示器布局改变后原坐标可能失效，及时停止，避免录到选区之外的屏幕内容。
-    private void OnDisplaySettingsChanging(object? sender, EventArgs e) => Ui(() => { inputRouter.ReturnLocal("显示器布局改变"); if (recording.IsRecording) _ = recording.StopAsync(); });
+    private void OnDisplaySettingsChanging(object? sender, EventArgs e) => Ui(() => { input.ReturnLocal("显示器布局改变"); if (recording.IsRecording) _ = recording.StopAsync(); });
 
     // 系统完成显示器调整后重新读取虚拟桌面边界。
     private void OnDisplaySettingsChanged(object? sender, EventArgs e) => Ui(SetInputRuntime);
@@ -315,7 +316,8 @@ internal sealed partial class MainForm : Form
     // 所有旧会话回调都用所属网络实例过滤，避免重启共享后旧消息污染新状态。
     private void AttachPeer(PeerNetwork current, PeerSession peer)
     {
-        BindInput(current, peer);
+        var registered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        BindInput(current, peer, registered);
         peer.ClipboardReceived += content => Ui(() => { if (network == current && peer.IsConnected) clipboard.Receive(content); });
         peer.FileReceived += path => Ui(() =>
         {
@@ -332,6 +334,7 @@ internal sealed partial class MainForm : Form
             if (network != current) return;
             settings.TrustedDeviceIds = current.TrustedIds.ToList();
             RememberInputPeer(peer);
+            registered.TrySetResult(true);
             try { settings.Save(); } catch (Exception ex) { Log("保存信任失败", ex.Message); }
             RefreshPeers(); Log(peer.PeerName, "已连接并记住此设备，下次自动连接");
         });
@@ -557,13 +560,22 @@ internal sealed partial class MainForm : Form
     }
 
     // 从托盘恢复窗口，并带到前台。
-    internal void RestoreWindow() { suppressFirstShow = false; ShowInTaskbar = true; Show(); WindowState = FormWindowState.Normal; Activate(); }
+    internal void RestoreWindow() { suppressFirstShow = false; ShowInTaskbar = true; if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal; Show(); Activate(); }
 
-    // 已在后台运行时，第二次启动通过本机窗口消息恢复当前窗口。
+    // 在系统开始最小化布局前直接收起到托盘，避免在尺寸变更中重入隐藏流程。
     protected override void WndProc(ref System.Windows.Forms.Message message)
     {
         if (message.Msg == 0x8201) { RestoreWindow(); return; }
+        const int wmSysCommand = 0x0112, scMinimize = 0xF020, wmSize = 0x0005, sizeMinimized = 1;
+        if (message.Msg == wmSysCommand && (message.WParam.ToInt64() & 0xFFF0) == scMinimize)
+        {
+            Hide();
+            return;
+        }
         base.WndProc(ref message);
+        // 兼容绕过系统菜单命令的最小化请求；等本次尺寸消息处理完再隐藏。
+        if (message.Msg == wmSize && message.WParam == sizeMinimized && Visible && !shuttingDown)
+            BeginInvoke(new Action(() => { if (Visible && WindowState == FormWindowState.Minimized) Hide(); }));
     }
 
     // 点击关闭只隐藏到托盘；托盘退出、系统关机和自检模式才真正释放资源。
@@ -592,7 +604,7 @@ internal sealed partial class MainForm : Form
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         recordingTimer.Dispose(); recording.Dispose();
         screenshotHotkey.Dispose(); recordingHotkey.Dispose(); screenshots.Dispose(); StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
-        inputTimer.Dispose(); inputDesktop.Dispose(); pointerMarker.Dispose();
+        input.Dispose();
         base.OnFormClosing(e);
     }
 

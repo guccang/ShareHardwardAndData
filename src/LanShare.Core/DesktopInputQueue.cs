@@ -2,14 +2,14 @@ using System.Diagnostics;
 
 namespace LanShare.Core;
 
-// 网络线程有序入队，界面线程每次处理一小批；只合并同一会话中连续的绝对位置。
+// 网络线程有序入队，键鼠线程每次处理一小批；只合并同一会话中连续的绝对位置。
 public sealed class DesktopInputQueue(Action<Action> post, Action<InputPacket> apply, Action failed) : IDisposable
 {
     private readonly LinkedList<InputPacket> items = new();
     private TaskCompletionSource? room;
     private bool scheduled, closed;
 
-    // 单个连接只有一个读取者。达到上限后等待界面取走事件，按钮与键盘绝不丢弃。
+    // 单个连接只有一个读取者。达到上限后等待键鼠线程取走事件，按钮与键盘绝不丢弃。
     public Task Add(InputPacket packet)
     {
         Task ready;

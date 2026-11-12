@@ -20,12 +20,24 @@ internal static class AppSelfTest
         using var restoredIdentity = restored.ReadIdentity();
         if (Security.Fingerprint(identity) != Security.Fingerprint(restoredIdentity)) throw new Exception("Identity persistence failed");
         lines.Add("PASS: DPAPI-protected identity survives settings roundtrip");
-        using (var input = new WindowsInput())
+        using (var loop = new InputMessageLoop())
         {
-            input.Start(); input.Dispose(); input.Start();
-            if (input.Width < 1 || input.Height < 1) throw new Exception("Invalid input desktop extent");
+            var tested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            loop.Post(() =>
+            {
+                try
+                {
+                    using var input = new WindowsInput();
+                    input.Start(); input.Dispose(); input.Start();
+                    if (input.Width < 1 || input.Height < 1 || SynchronizationContext.Current is not WindowsFormsSynchronizationContext)
+                        throw new Exception("Invalid input desktop extent or missing input message context");
+                    tested.SetResult();
+                }
+                catch (Exception ex) { tested.SetException(ex); }
+            });
+            tested.Task.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
         }
-        lines.Add("PASS: Windows keyboard and mouse hooks install, release and reinstall without injecting input");
+        lines.Add("PASS: dedicated input thread installs, releases and reinstalls both Windows hooks while UI waits");
         if (!WindowsInput.TryMakeKey(65, 30, 0, out var letter) || letter.A != 65 || letter.B != 30 || letter.C != 0 ||
             !WindowsInput.TryMakeKey(0x25, 0xE04B, 0x80, out var left) || left.B != 0x4B || left.C != 3 ||
             !WindowsInput.TryMakeKey(0x13, 0xE145, 0, out var pause) || pause.B != 0 ||
@@ -104,6 +116,7 @@ internal static class AppSelfTest
         using var form = new MainForm(true);
         form.SavePreview(Path.ChangeExtension(report, ".png"));
         for (int page = 1; page < 6; page++) form.SavePreview(Path.Combine(Path.GetDirectoryName(report)!, $"page-{page}.png"), page);
+        MinimizeTests.Run(form, lines);
         form.Close(); Application.DoEvents();
         if (form.IsDisposed || form.Visible) throw new Exception("Close must hide to tray without disposal");
         lines.Add("PASS: window close keeps application alive in tray");

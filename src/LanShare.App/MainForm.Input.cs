@@ -6,9 +6,8 @@ namespace LanShare.App;
 internal sealed partial class MainForm
 {
     private const string CardFormat = "SimpleLanShare.InputLayout";
-    private readonly WindowsInput inputDesktop = new();
-    private readonly RemotePointerMarker pointerMarker = new();
-    private readonly System.Windows.Forms.Timer inputTimer = new() { Interval = 150 };
+    private InputRuntime input = null!;
+    private volatile bool selectingForCapture;
     private readonly Dictionary<string, PeerSession> inputPeers = [];
     private readonly FlowLayoutPanel inputCards = Flow();
     private readonly Label inputStatus = new() { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft };
@@ -17,7 +16,6 @@ internal sealed partial class MainForm
     private readonly Button moveLeft = MakeButton("向左移", width: 80), moveRight = MakeButton("向右移", width: 80);
     private string inputLocalId = "", selectedInputId = "";
     private bool inputLocked;
-    private SharedInput inputRouter = null!;
 
     // 在窗口构建前初始化状态机，系统钩子只在用户开启该功能后安装。
     private void InitializeInput()
@@ -29,67 +27,39 @@ internal sealed partial class MainForm
         foreach (string id in settings.TrustedDeviceIds)
             if (!settings.InputOrder.Contains(id)) settings.InputOrder.Add(id);
         if (settings.SharedLayout is {} saved) settings.InputOrder = saved.ForKnownDevices(settings.InputOrder);
-        inputRouter = new SharedInput(inputLocalId, inputDesktop, InputNeighbor,
-            id => settings.InputAllowed.Contains(id) && settings.TrustedDeviceIds.Contains(id) && !inputDesktop.HasPendingReleases,
-            (id, packet) => inputPeers.TryGetValue(id, out var peer) && peer.Input?.TrySend(packet) == true,
-            () => screenshots.IsCapturing || (recording.IsBusy && !recording.IsRecording));
-        inputDesktop.Router = inputRouter;
-        inputDesktop.ReturnKey = settings.InputReturnKey;
-        inputTimer.Tick += (_, _) =>
+        input = new(inputLocalId, () => selectingForCapture);
+        input.Changed += (reason, notice) => Ui(() =>
         {
-            bool active = WindowsInput.OnUserDesktop();
-            if (active && inputDesktop.HasPendingReleases) inputDesktop.RetryReleases();
-            bool enabled = active && settings.InputEnabled && network is not null && !inputLocked && !shuttingDown;
-            if (inputRouter.Enabled != enabled) { inputRouter.Enable(enabled); UpdateInputStatus(); }
-            if (!enabled && !inputDesktop.HasPendingReleases && (network is null || !settings.InputEnabled || inputLocked)) inputTimer.Stop();
-            inputRouter.Tick();
-        };
-        inputRouter.Changed += reason => Ui(() => { UpdateInputStatus(reason); Log("键鼠共享", reason); });
-        inputRouter.Notice += reason => Ui(() => { UpdateInputStatus(); inputStatus.Text += " · " + reason; Log("键盘输入", reason); });
+            UpdateInputStatus(notice ? null : reason);
+            if (notice) inputStatus.Text += " · " + reason;
+            if (reason is not null) Log(notice ? "键盘输入" : "键鼠共享", reason);
+        });
     }
 
-    // 只跨到布局中紧邻的在线电脑，离线位置保留，重连后恢复使用。
-    private string? InputNeighbor(string from, int side)
-    {
-        int index = settings.InputOrder.IndexOf(from);
-        int next = index + side;
-        if (index < 0 || next < 0 || next >= settings.InputOrder.Count) return null;
-        string id = settings.InputOrder[next];
-        return id == inputLocalId || (inputPeers.TryGetValue(id, out var peer) && peer.Input?.IsOpen == true) ? id : null;
-    }
+    // 在界面线程复制布局、授权和在线会话；键鼠线程只读取属于自己的快照。
+    private void PublishInputConfiguration() => input.Configure(settings.InputOrder.ToArray(),
+        settings.InputAllowed.Intersect(settings.TrustedDeviceIds).ToHashSet(), new(inputPeers));
 
     // 显示易读设备名，未获得名称的旧配对用短指纹区分。
     private string InputName(string id) => id == inputLocalId ? Environment.MachineName : settings.InputNames.GetValueOrDefault(id, id[..Math.Min(8, id.Length)]);
 
     // 将系统桌面状态、共享总开关与用户设置合并；停用时先释放按键再移除钩子。
-    private void SetInputRuntime()
-    {
-        if (settings.InputEnabled && network is not null && !inputLocked && !smoke && !shuttingDown)
-        {
-            try { inputDesktop.Start(); inputRouter.Enable(WindowsInput.OnUserDesktop()); inputTimer.Start(); }
-            catch (Exception ex) { inputRouter.Enable(false); inputTimer.Stop(); UpdateInputStatus(ex.Message); return; }
-        }
-        else
-        {
-            inputRouter.Enable(false); inputDesktop.Dispose();
-            if (inputDesktop.HasPendingReleases && !shuttingDown) inputTimer.Start(); else inputTimer.Stop();
-        }
-        UpdateInputStatus();
-    }
+    private void SetInputRuntime() =>
+        input.SetRunning(settings.InputEnabled && network is not null && !inputLocked && !smoke && !shuttingDown);
 
     // 页面与托盘标出当前控制方向；活动记录不保存按键内容。
     private void UpdateInputStatus(string? reason = null)
     {
-        pointerMarker.SetReceiving(!shuttingDown && inputRouter.Mode == ControlMode.Receiving);
-        string name = inputRouter.Peer is {} id ? InputName(id) : "";
-        string status = inputRouter.Mode switch
+        var statusSnapshot = input.Current;
+        string name = statusSnapshot.Peer is {} id ? InputName(id) : "";
+        string status = statusSnapshot.Mode switch
         {
             ControlMode.Sending => "正在控制 " + name,
             ControlMode.Receiving => "正由 " + name + " 控制",
             ControlMode.Waiting => "正在等待 " + name + " 接管",
-            _ => inputRouter.Enabled ? "键鼠在本机" : settings.InputEnabled ? "键鼠共享已暂停" : "键鼠共享已关闭"
+            _ => statusSnapshot.Enabled ? "键鼠在本机" : settings.InputEnabled ? "键鼠共享已暂停" : "键鼠共享已关闭"
         };
-        inputStatus.Text = reason is null || inputRouter.Mode != ControlMode.Local ? status : status + " · " + reason;
+        inputStatus.Text = reason is null || statusSnapshot.Mode != ControlMode.Local ? status : status + " · " + reason;
         if (!recording.IsBusy && !shuttingDown && network is not null)
         {
             string text = "局域共享 · " + status;
@@ -97,8 +67,8 @@ internal sealed partial class MainForm
         }
     }
 
-    // 所有事件按到达顺序在窗口线程处理，旧连接的回调不能接管已重连的设备。
-    private void BindInput(PeerNetwork current, PeerSession peer)
+    // 布局由主界面处理，键鼠数据直接投递到专用消息循环。
+    private void BindInput(PeerNetwork current, PeerSession peer, TaskCompletionSource<bool> registered)
     {
         peer.LayoutReceived += layout => Ui(() =>
         {
@@ -106,17 +76,10 @@ internal sealed partial class MainForm
                 ApplySharedLayout(layout, peer);
         });
         if (peer.Input is not {} link) return;
-        var inbox = new DesktopInputQueue(action => BeginInvoke(action), packet =>
-        {
-            if (!shuttingDown && network == current && link.IsOpen && inputPeers.GetValueOrDefault(peer.PeerId) == peer)
-                inputRouter.Receive(peer.PeerId, packet);
-        }, link.Dispose);
-        link.Received = inbox.Add;
-        link.Closed += inbox.Dispose;
+        input.Bind(peer, registered);
         link.Closed += () => Ui(() =>
         {
             if (network != current || inputPeers.GetValueOrDefault(peer.PeerId) != peer) return;
-            if (inputRouter.Peer == peer.PeerId) inputRouter.ReturnLocal("键鼠连接已断开");
             RefreshInputCards();
         });
     }
@@ -139,7 +102,6 @@ internal sealed partial class MainForm
     private void DetachInput(PeerSession peer)
     {
         if (inputPeers.GetValueOrDefault(peer.PeerId) != peer) return;
-        if (inputRouter.Peer == peer.PeerId) inputRouter.ReturnLocal("对方已离线");
         inputPeers.Remove(peer.PeerId);
         RefreshInputCards();
     }
@@ -167,8 +129,7 @@ internal sealed partial class MainForm
         {
             if (!settings.TrustedDeviceIds.Contains(selectedInputId)) return;
             if (!settings.InputAllowed.Remove(selectedInputId)) settings.InputAllowed.Add(selectedInputId);
-            else if (inputRouter.Peer == selectedInputId && inputRouter.Mode == ControlMode.Receiving)
-                inputRouter.ReturnLocal("已撤销控制权限");
+            PublishInputConfiguration();
             SaveInputSettings(); UpdateCardSelection();
         };
         var permissions = Flow(); permissions.Controls.Add(inputPermission); page.Controls.Add(permissions, 0, 6);
@@ -177,8 +138,8 @@ internal sealed partial class MainForm
         Keys[] choices = [Keys.Home, Keys.End, Keys.Pause];
         foreach (var key in choices) keys.Items.Add("Ctrl + Alt + " + key);
         keys.SelectedIndex = Math.Max(0, Array.IndexOf(choices, settings.InputReturnKey));
-        inputDesktop.ReturnKey = choices[keys.SelectedIndex];
-        keys.SelectedIndexChanged += (_, _) => { settings.InputReturnKey = inputDesktop.ReturnKey = choices[keys.SelectedIndex]; SaveInputSettings(); };
+        input.SetReturnKey(choices[keys.SelectedIndex]);
+        keys.SelectedIndexChanged += (_, _) => { settings.InputReturnKey = choices[keys.SelectedIndex]; input.SetReturnKey(settings.InputReturnKey); SaveInputSettings(); };
         shortcuts.Controls.Add(keys); page.Controls.Add(shortcuts, 0, 7);
         page.Controls.Add(inputStatus, 0, 8);
         RefreshInputCards(); UpdateInputStatus(); return page;
@@ -196,6 +157,7 @@ internal sealed partial class MainForm
     {
         if (!settings.InputOrder.Contains(inputLocalId)) settings.InputOrder.Insert(0, inputLocalId);
         if (!settings.InputOrder.Contains(selectedInputId)) selectedInputId = inputLocalId;
+        PublishInputConfiguration();
         inputCards.SuspendLayout();
         while (inputCards.Controls.Count > 0) inputCards.Controls[0].Dispose();
         foreach (string id in settings.InputOrder)
@@ -253,7 +215,7 @@ internal sealed partial class MainForm
             settings.SharedLayout = oldLayout; settings.InputOrder = oldOrder;
             Log("排列保存失败", ex.Message); inputStatus.Text = "排列保存失败：" + ex.Message; return;
         }
-        if (!oldOrder.SequenceEqual(settings.InputOrder)) inputRouter.ReturnLocal("桌面排列已改变");
+        if (!oldOrder.SequenceEqual(settings.InputOrder)) input.ReturnLocal("桌面排列已改变");
         RefreshInputCards();
         foreach (var peer in inputPeers.Values)
             if (peer != source) _ = SendLayoutAsync(peer, layout);
