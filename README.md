@@ -1,4 +1,4 @@
-# 局域共享 · Simple LAN Share 0.6.6
+# 局域共享 · Simple LAN Share 0.6.7
 
 在同一局域网的多台 Windows 电脑之间共享一套键盘和鼠标、同步文字和图片剪贴板、拖拽传文件。
 
@@ -39,6 +39,8 @@
 键鼠共享适用于普通 Windows 用户桌面，电脑按水平位置排列，各自的多块显示器属于同一桌面。锁屏、停用或连接中断会结束本次控制并释放已转发的按键。重连后需要再次主动跨屏。输入使用单独的加密连接，文件传输期间也能操作。活动记录不保存按键内容。
 
 如果键盘输入被目标窗口拒绝，键鼠页会显示提示，可点击目标电脑的普通窗口再试。发生回切时，在“活动记录”中可以查看是实体设备接管、共享暂停还是连接超时。两端使用 0.6.2 后可在控制端直接查看对方传回的原因。
+
+受控电脑打开任务管理器等管理员窗口后，如果该窗口的权限高于局域共享，两端会结束本次接管并提示原因。要操作该窗口，在受控电脑上从托盘右键退出局域共享，再右键原目录的 `SimpleLanShare.exe`，选择**以管理员身份运行**，在该电脑上确认 Windows 提示。控制端保持原来的启动方式，重新跨屏即可。切回普通权限的窗口也可以重新跨屏。
 
 ## 开机后台运行
 
@@ -121,7 +123,7 @@ Windows 上安装 .NET 8 SDK 或可构建 .NET 8 的更新 SDK：
 .\scripts\build.ps1
 ```
 
-生成 `artifacts\SimpleLanShare-0.6.6-win-x64\SimpleLanShare.exe` 和同名 ZIP。首次构建需要下载微软运行时包，没有第三方 NuGet 依赖。已有缓存时可用 `scripts/build.ps1 -Offline` 离线发布。开发时可直接打开窗口。
+生成 `artifacts\SimpleLanShare-0.6.7-win-x64\SimpleLanShare.exe` 和同名 ZIP。首次构建需要下载微软运行时包，没有第三方 NuGet 依赖。已有缓存时可用 `scripts/build.ps1 -Offline` 离线发布。开发时可直接打开窗口。
 
 ```powershell
 dotnet run --project src\LanShare.App\LanShare.App.csproj -- --show

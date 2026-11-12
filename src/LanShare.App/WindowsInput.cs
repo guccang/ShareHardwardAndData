@@ -11,6 +11,7 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
     private nint mouseHook, keyHook;
     private readonly HashSet<int> suppressedKeys = [], suppressedButtons = [];
     private readonly HashSet<InputPacket> pendingReleases = [];
+    public bool ForegroundHasHigherIntegrity => InputIntegrity.ForegroundIsHigher();
     public bool HasPendingReleases => pendingReleases.Count != 0;
     private Rectangle bounds;
     private Rectangle[] monitors = [];
@@ -261,7 +262,7 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
     // 锁屏或权限切换可暂时阻止释放，保存未被系统接受的抬起事件。
     public void Release(InputPacket packet)
     {
-        if (!Inject(packet)) pendingReleases.Add(packet);
+        if (ForegroundHasHigherIntegrity || !Inject(packet)) pendingReleases.Add(packet);
     }
 
     // 只补发会话清理时的抬起，不重放按下、文字或鼠标移动。

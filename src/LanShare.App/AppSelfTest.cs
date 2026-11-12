@@ -10,6 +10,10 @@ internal static class AppSelfTest
     public static void Run(string report)
     {
         var lines = new List<string>();
+        if (InputIntegrity.Local is not > 0 || InputIntegrity.ReadProcess(Environment.ProcessId) != InputIntegrity.Local ||
+            InputIntegrity.ReadProcess(-1) is not null)
+            throw new Exception("Windows process integrity query failed");
+        lines.Add($"PASS: current process integrity RID {InputIntegrity.Local:X}, missing process handled without blocking input");
         string code = Guid.NewGuid().ToString("N");
         string protectedCode = AppSettings.Protect(code, false);
         if (protectedCode == code || AppSettings.Protect(protectedCode, true) != code) throw new Exception("DPAPI roundtrip failed");

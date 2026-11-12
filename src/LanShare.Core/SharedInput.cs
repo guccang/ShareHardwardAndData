@@ -7,6 +7,8 @@ public interface IInputDesktop
     int Height { get; }
     (int X, int Y) Anchor { get; }
     bool PhysicalInputHeld { get; }
+    // 前台窗口的完整性高于接收进程时，普通桌面输入无法可靠送达。
+    bool ForegroundHasHigherIntegrity => false;
     bool Move(int x, int y);
     bool Inject(InputPacket packet);
     // 只在被控期间需要确认本机实体设备活动，发送端避免重复订阅鼠标事件。
@@ -20,12 +22,13 @@ public interface IInputDesktop
 public enum ControlMode { Local, Waiting, Sending, Receiving }
 
 // End 帧只传递固定的退出原因，旧版忽略该字段，不包含按键或窗口内容。
-public enum InputEnd { Normal, LocalKeyboard, LocalMouse, Paused, KeyboardRejected, PointerRejected, Timeout }
+public enum InputEnd { Normal, LocalKeyboard, LocalMouse, Paused, KeyboardRejected, PointerRejected, Timeout, HigherIntegrity }
 
 // 所有状态变更在桌面消息线程上串行执行。两个方向使用相同的授权、心跳及释放规则。
 public sealed class SharedInput(string localId, IInputDesktop desktop, Func<string, int, string?> neighbor,
     Func<string, bool> authorized, Func<string, InputPacket, bool> send, Func<bool> selecting, Func<long>? milliseconds = null)
 {
+    private const string LocalPrivilegeReason = "前台窗口权限高于局域共享。操作此窗口需要在本机以管理员身份运行局域共享。";
     private readonly Func<long> now = milliseconds ?? (() => Environment.TickCount64);
     private readonly HashSet<InputPacket> held = [];
     private Guid lease;
@@ -92,12 +95,19 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
                 send(peer, new(InputOp.End, packet.Lease));
                 return;
             }
+            if (desktop.ForegroundHasHigherIntegrity)
+            {
+                send(peer, new(InputOp.End, packet.Lease, (int)InputEnd.HigherIntegrity));
+                Notice?.Invoke(LocalPrivilegeReason);
+                return;
+            }
             Peer = peer; lease = packet.Lease; contact = now(); nextPulse = contact;
             Mode = ControlMode.Receiving;
             desktop.SetReceiving(true);
             int startX = packet.A > 0 ? 1 : desktop.Width - 2;
-            if (!desktop.Move(startX, Pixel(packet.B, desktop.Height)) ||
-                !send(peer, new(InputOp.Grant, lease, desktop.Width, desktop.Height)))
+            if (!desktop.Move(startX, Pixel(packet.B, desktop.Height)))
+                EndRejectedPointer();
+            else if (!send(peer, new(InputOp.Grant, lease, desktop.Width, desktop.Height)))
                 ReturnLocal("无法接管桌面");
             else Changed?.Invoke("正在接受控制");
             return;
@@ -113,6 +123,7 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
                 InputEnd.Paused => "对方已暂停共享或离开普通桌面",
                 InputEnd.KeyboardRejected => "对方窗口拒绝键盘输入，已释放按键",
                 InputEnd.PointerRejected => "对方桌面无法接收鼠标输入",
+                InputEnd.HigherIntegrity => "对方前台窗口权限更高，键鼠已返回本机。操作该窗口需要在受控电脑上以管理员身份运行局域共享。",
                 InputEnd.Timeout => "对方等待键鼠连接超时",
                 _ => Mode == ControlMode.Waiting ? "对方暂未接管，请检查目标电脑的开关与授权" : "已返回本机"
             });
@@ -144,7 +155,7 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
         if (!authorized(peer)) { ReturnLocal("已撤销控制权限"); return; }
         if (packet.Op == InputOp.Move)
         {
-            if (!desktop.Move(packet.A, packet.B)) ReturnLocal("系统无法移动光标", InputEnd.PointerRejected);
+            if (!desktop.Move(packet.A, packet.B)) EndRejectedPointer();
         }
         else if (packet.Op is InputOp.Key or InputOp.Button or InputOp.Wheel)
         {
@@ -152,7 +163,8 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
             if (packet.Op == InputOp.Key && (packet.C & 1) != 0 && !held.Contains(packet with { C = packet.C & ~1 })) return;
             if (!desktop.Inject(packet))
             {
-                if (packet.Op == InputOp.Key && held.Count == 0) SetKeyboardBlocked(true);
+                if (desktop.ForegroundHasHigherIntegrity) ReturnLocal(LocalPrivilegeReason, InputEnd.HigherIntegrity);
+                else if (packet.Op == InputOp.Key && held.Count == 0) SetKeyboardBlocked(true);
                 else ReturnLocal("系统拒绝输入，已释放按键并返回本机",
                     packet.Op == InputOp.Key ? InputEnd.KeyboardRejected : InputEnd.PointerRejected);
                 return;
@@ -160,6 +172,13 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
             Remember(packet);
             if (packet.Op == InputOp.Key) SetKeyboardBlocked(false);
         }
+    }
+
+    // 输入失败时重新检查焦点，保留其他鼠标失败的原有原因。
+    private void EndRejectedPointer()
+    {
+        if (desktop.ForegroundHasHigherIntegrity) ReturnLocal(LocalPrivilegeReason, InputEnd.HigherIntegrity);
+        else ReturnLocal("系统无法移动光标", InputEnd.PointerRejected);
     }
 
     // 首次按键被窗口拒绝时保留鼠标控制，允许切回普通窗口；两端都显示原因。
@@ -255,6 +274,11 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
         long time = now();
         if (time - contact >= 1800) { ReturnLocal("键鼠连接超时，已返回本机", InputEnd.Timeout); return; }
         if (Mode == ControlMode.Waiting || time < nextPulse) return;
+        if (Mode == ControlMode.Receiving && desktop.ForegroundHasHigherIntegrity)
+        {
+            ReturnLocal(LocalPrivilegeReason, InputEnd.HigherIntegrity);
+            return;
+        }
         nextPulse = time + 300;
         if (!send(Peer!, new(InputOp.Pulse, lease, selecting() ? 1 : 0, Mode == ControlMode.Receiving && keyboardBlocked ? 1 : 0))) ReturnLocal("键鼠连接已断开");
     }

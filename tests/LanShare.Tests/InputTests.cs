@@ -95,6 +95,24 @@ internal static class InputTests
         check(a.Mode == ControlMode.Local && b.Mode == ControlMode.Local && target.Events.Last().C == 1, "target takeover releases modifier");
         check(reason == "对方的实体鼠标已接管", "controller receives remote takeover reason");
         check(!source.Hidden, "target physical takeover also restores sender cursor");
+        // 已授权的目标在接管中切换到高权限窗口，两端都应及时退出并释放按键。
+        PushEdge(); Dispatch();
+        a.PhysicalEvent(ctrl); Dispatch();
+        target.ForegroundHasHigherIntegrity = true;
+        clock += 350; b.Tick(); Dispatch();
+        check(a.Mode == ControlMode.Local && b.Mode == ControlMode.Local && !source.Hidden && target.Events.Last().C == 1,
+            "higher-integrity foreground releases the active lease, modifier and sender cursor");
+        check(reason?.Contains("受控电脑上以管理员身份运行") == true, "controller receives actionable privilege reason");
+        int eventCount = target.Events.Count;
+        PushEdge(); Dispatch();
+        check(a.Mode == ControlMode.Local && b.Mode == ControlMode.Local && !source.Hidden && target.Events.Count == eventCount,
+            "receiver rejects entry while foreground integrity remains higher");
+        target.ForegroundHasHigherIntegrity = false;
+        PushEdge(); Dispatch();
+        a.PhysicalEvent(leftDown); a.PhysicalEvent(leftDown with { B = 0 }); Dispatch();
+        check(a.Mode == ControlMode.Sending && b.Mode == ControlMode.Receiving && target.Events.Count == eventCount + 2,
+            "matching integrity permits re-entry and clicks without re-pairing");
+        a.ReturnLocal("测试结束"); Dispatch();
         PushEdge(); Dispatch();
         a.PhysicalEvent(leftDown); Dispatch();
         clock += 1900; b.Tick(); packets.Clear(); a.Tick(); packets.Clear();
@@ -142,6 +160,7 @@ internal static class InputTests
         public bool Selecting { get; set; }
         public bool RefuseKey { get; set; }
         public bool RefuseMove { get; set; }
+        public bool ForegroundHasHigherIntegrity { get; set; }
         public bool Hidden { get; private set; }
         // 记录发送端指针的可见状态。
         public bool SetSending(bool sending) { Hidden = sending; return true; }

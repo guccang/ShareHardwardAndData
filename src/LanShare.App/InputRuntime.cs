@@ -85,7 +85,7 @@ internal sealed class InputRuntime : IDisposable
     private void Tick()
     {
         bool active = WindowsInput.OnUserDesktop();
-        if (active && desktop.HasPendingReleases) desktop.RetryReleases();
+        if (active && desktop.HasPendingReleases && !desktop.ForegroundHasHigherIntegrity) desktop.RetryReleases();
         bool enabled = running && active;
         if (router.Enabled != enabled) { router.Enable(enabled); Publish(); }
         if (!running && !desktop.HasPendingReleases) timer.Stop();

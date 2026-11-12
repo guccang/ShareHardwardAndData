@@ -32,7 +32,7 @@ internal sealed partial class MainForm
         {
             UpdateInputStatus(notice ? null : reason);
             if (notice) inputStatus.Text += " · " + reason;
-            if (reason is not null) Log(notice ? "键盘输入" : "键鼠共享", reason);
+            if (reason is not null) Log("键鼠共享", reason);
         });
     }
 
@@ -113,7 +113,9 @@ internal sealed partial class MainForm
         page.AutoScroll = true;
         var enabled = new CheckBox { Text = "启用键鼠共享", AutoSize = true, Checked = settings.InputEnabled, Margin = new Padding(3, 8, 10, 0) };
         enabled.CheckedChanged += (_, _) => { settings.InputEnabled = enabled.Checked; SetInputRuntime(); SaveInputSettings(); };
-        var first = Flow(); first.Controls.Add(enabled); page.Controls.Add(first, 0, 0);
+        var first = Flow(); first.Controls.Add(enabled);
+        string permission = InputIntegrity.Local switch { >= 0x3000 => "本机以管理员权限运行", null => "本机权限未知", _ => "本机以普通权限运行" };
+        first.Controls.Add(Caption(permission)); page.Controls.Add(first, 0, 0);
         page.Controls.Add(TextLine("电脑排列", 14, true), 0, 1);
         page.Controls.Add(TextLine("拖动卡片调整左右顺序，排列会自动同步到已配对的电脑。", 10), 0, 2);
         inputCards.AutoScroll = true; page.Controls.Add(inputCards, 0, 3);
