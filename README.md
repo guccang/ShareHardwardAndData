@@ -1,4 +1,4 @@
-# 局域共享 · Simple LAN Share 0.6.5
+# 局域共享 · Simple LAN Share 0.6.6
 
 在同一局域网的多台 Windows 电脑之间共享一套键盘和鼠标、同步文字和图片剪贴板、拖拽传文件。
 
@@ -19,9 +19,15 @@
 - 右键文件夹内或桌面的空白处，选择 **打开共享目录**，即可进入本机在“设置”中指定的接收目录。
 - 新版从固定位置运行一次即可为当前 Windows 用户添加菜单。Windows 11 的经典菜单在 **显示更多选项** 中。可在“设置”里取消勾选 **资源管理器右键菜单** 来移除这些命令。
 
-接收目录默认为 `%USERPROFILE%\Downloads\SimpleLanShare`，可停止共享后更改。默认自动接收已配对设备的文件；关闭此选项后逐个确认。重名文件自动加序号，不覆盖原文件，不自动执行收到的程序。
+接收目录默认为 `%USERPROFILE%\Downloads\SimpleLanShare`，可停止共享后更改。默认自动接收已配对设备的文件；关闭此选项后逐个确认。重名文件自动加序号，不覆盖原文件，普通文件只保存到接收目录。
 
 主界面左侧有文件共享、截图、录屏、设置、活动记录和键鼠共享六页。接收目录、剪贴板、自启动和手动连接在“设置”中管理。
+
+## 从已配对电脑更新
+
+每台电脑先手动安装一次 0.6.6。以后把新版发布包 `SimpleLanShare-版本-win-x64.zip` 像普通文件一样拖给目标电脑，或用资源管理器右键发送。接收完成后，目标电脑验证内置发布公钥的签名、文件哈希、版本和 Git 提交；只有更高版本才会安装。
+
+更新会等待当前录屏和本机文件发送结束，在便携版的原目录替换程序并重启到托盘。该目录需要当前用户可写。已配对设备、设置和接收文件继续保留。写入失败或新版启动检查失败时会尝试恢复旧版。主窗口左下角显示实际运行版本及 Git 提交的前 12 位。
 
 ## 一套键鼠操作多台电脑
 
@@ -115,7 +121,7 @@ Windows 上安装 .NET 8 SDK 或可构建 .NET 8 的更新 SDK：
 .\scripts\build.ps1
 ```
 
-生成 `artifacts\SimpleLanShare-0.6.5-win-x64\SimpleLanShare.exe` 和同名 ZIP。首次构建需要下载微软运行时包，没有第三方 NuGet 依赖。已有缓存时可用 `scripts/build.ps1 -Offline` 离线发布。开发时可直接打开窗口。
+生成 `artifacts\SimpleLanShare-0.6.6-win-x64\SimpleLanShare.exe` 和同名 ZIP。首次构建需要下载微软运行时包，没有第三方 NuGet 依赖。已有缓存时可用 `scripts/build.ps1 -Offline` 离线发布。开发时可直接打开窗口。
 
 ```powershell
 dotnet run --project src\LanShare.App\LanShare.App.csproj -- --show
@@ -124,3 +130,5 @@ dotnet run --project src\LanShare.App\LanShare.App.csproj -- --show
 结构：`LanShare.Core` 为发现、身份确认、协议与传输，`LanShare.App` 为原生 Windows 界面与系统剪贴板，`tests/LanShare.Tests` 为真实 TCP/TLS 回环集成测试。参考提供的 LAN-Bridge 文档独立实现，未复用其源码或二进制。
 
 自动化验证覆盖回环网络、键鼠状态切换及 Windows 自检。实际多台电脑的指针手感、混合 DPI、输入法和录屏效果需要在对应桌面上验证。详情见 `VERIFICATION.md`。
+
+发布脚本从项目文件读取版本号，并使用当前用户个人证书库中与 `src/LanShare.App/Assets/update-publisher.cer` 匹配的私钥签名。发布者迁移构建机时需安全迁移带私钥的证书；使用软件的电脑只需要 ZIP。局部开发可直接运行 `dotnet build`。

@@ -116,6 +116,11 @@ internal static class AppSelfTest
         using var form = new MainForm(true);
         form.SavePreview(Path.ChangeExtension(report, ".png"));
         for (int page = 1; page < 6; page++) form.SavePreview(Path.Combine(Path.GetDirectoryName(report)!, $"page-{page}.png"), page);
+        if (BuildIdentity.Commit.Length == 40 && !BuildIdentity.Commit.All(Uri.IsHexDigit))
+            throw new Exception("Invalid embedded Git commit");
+        if (!UpdatePackage.IsCandidate("SimpleLanShare-0.6.7-win-x64 (1).zip") || UpdatePackage.IsCandidate("我的照片.zip"))
+            throw new Exception("Incorrect update package detection");
+        lines.Add($"PASS: running build {BuildIdentity.Info}, received package name and duplicate suffix recognized");
         MinimizeTests.Run(form, lines);
         ExplorerMenuTests.CheckRegistry();
         lines.Add("PASS: Explorer file submenu and both background verbs register, update and uninstall under an isolated key");

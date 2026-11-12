@@ -45,7 +45,7 @@ internal sealed partial class MainForm
             button.Click += (_, _) => SelectPage(index);
             navigation.Add(button); sidebar.Controls.Add(button, 0, i + 1);
         }
-        sidebar.Controls.Add(new Label { Text = "本机\n" + Environment.MachineName, Dock = DockStyle.Fill, ForeColor = Muted, TextAlign = ContentAlignment.BottomLeft }, 0, pageNames.Length + 2);
+        sidebar.Controls.Add(new Label { Text = $"本机  {Environment.MachineName}\nv{BuildIdentity.Version}\nGit {BuildIdentity.ShortCommit}", Dock = DockStyle.Fill, ForeColor = Muted, TextAlign = ContentAlignment.BottomLeft }, 0, pageNames.Length + 2);
         shell.Controls.Add(sidebar, 0, 0);
 
         var workspace = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(28, 20, 28, 12), ColumnCount = 1, RowCount = 3, Margin = Padding.Empty };

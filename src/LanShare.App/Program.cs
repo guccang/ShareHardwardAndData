@@ -10,6 +10,36 @@ internal static class Program
     private static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
+        if (args is ["--apply-update", var pid, var ticks] && int.TryParse(pid, out int parent) && long.TryParse(ticks, out long started))
+        {
+            try { PortableUpdate.RunWorker(parent, started); }
+            catch (Exception ex)
+            {
+                Environment.ExitCode = 1;
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SimpleLanShare");
+                Directory.CreateDirectory(dir);
+                File.WriteAllText(Path.Combine(dir, "update-error.log"), DateTime.Now + " " + ex.Message);
+            }
+            return;
+        }
+        // 发布包自检启动真实的隐藏窗体，只验证启动握手，不注册菜单或启动项。
+        if (args is ["--self-test-restart", var testStage, var testWorker] && int.TryParse(testWorker, out int testPid))
+        {
+            using var testForm = new MainForm(smoke: true, startInTray: true);
+            testForm.AfterRuntimeReady = () =>
+            {
+                if (!testForm.Visible) PortableUpdate.Started(testStage, testPid);
+                testForm.BeginInvoke(new Action(testForm.ExitApplication));
+            };
+            Application.Run(testForm);
+            return;
+        }
+        if (args is ["--self-test-package", var package, var report])
+        {
+            try { UpdateTests.Run(package, report); }
+            catch (Exception ex) { File.WriteAllText(report, ex.ToString()); Environment.ExitCode = 1; }
+            return;
+        }
         if (args.Length == 2 && args[0] == "--self-test")
         {
             try { AppSelfTest.Run(Path.GetFullPath(args[1])); }
@@ -49,11 +79,17 @@ internal static class Program
                 return;
             }
             var window = FindWindow(null, "局域共享 · Simple LAN Share");
-            if (!args.Contains("--background", StringComparer.OrdinalIgnoreCase) && window != IntPtr.Zero) PostMessage(window, 0x8201, IntPtr.Zero, IntPtr.Zero);
+            if (!args.Contains("--background", StringComparer.OrdinalIgnoreCase) && args.FirstOrDefault() != "--updated" && window != IntPtr.Zero) PostMessage(window, 0x8201, IntPtr.Zero, IntPtr.Zero);
             return;
         }
         Application.ThreadException += (_, e) => MessageBox.Show(e.Exception.Message, "局域共享", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        try { Application.Run(new MainForm(startInTray: request is not null || !args.Contains("--show", StringComparer.OrdinalIgnoreCase), initialSend: request)); }
+        try
+        {
+            using var form = new MainForm(startInTray: request is not null || !args.Contains("--show", StringComparer.OrdinalIgnoreCase), initialSend: request);
+            if (args is ["--updated", var stage, var worker] && int.TryParse(worker, out int workerId))
+                form.AfterRuntimeReady = () => PortableUpdate.Started(stage, workerId);
+            Application.Run(form);
+        }
         finally { instance.ReleaseMutex(); }
     }
     // 命令行助手没有主窗体，直接向发起操作的用户展示失败原因。

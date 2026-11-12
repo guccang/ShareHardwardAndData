@@ -136,7 +136,7 @@ internal sealed partial class MainForm : Form
     {
         if (runtimeInitialized || shuttingDown) return;
         runtimeInitialized = true;
-        if (smoke) return;
+        if (smoke) { AfterRuntimeReady?.Invoke(); return; }
         try { StartupRegistration.SetEnabled(settings.LaunchAtLogin, StartupRegistration.CurrentCommand()); settings.Save(); }
         catch (Exception ex) { Log("自启动设置失败", ex.Message); tray.ShowBalloonTip(3000, "自启动设置失败", "可打开窗口重新设置：" + ex.Message, ToolTipIcon.Warning); }
         ApplyExplorerMenu();
@@ -146,6 +146,7 @@ internal sealed partial class MainForm : Form
         if (recordingHotkey.Error is not null) { Log("录屏快捷键", recordingHotkey.Error); recordingMessage.Text = recordingHotkey.Error; tray.ShowBalloonTip(3000, "录屏快捷键未注册", recordingHotkey.Error, ToolTipIcon.Warning); }
         if (screenshotHotkey.Error is not null) { Log("截图快捷键", screenshotHotkey.Error); tray.ShowBalloonTip(3000, "截图快捷键未注册", screenshotHotkey.Error, ToolTipIcon.Warning); }
         else if (!Visible) tray.ShowBalloonTip(2000, "局域共享已在后台运行", screenshotHotkey.Label + " 截图；双击托盘图标打开窗口。", ToolTipIcon.Info);
+        AfterRuntimeReady?.Invoke();
     }
 
     // 用户选项立即写入当前用户启动项，失败时恢复界面和先前配置。
@@ -328,6 +329,7 @@ internal sealed partial class MainForm : Form
             if (network != current) return;
             var item = new ListViewItem([Path.GetFileName(path), peer.PeerName, path]) { Tag = path };
             received.Items.Insert(0, item); Log(peer.PeerName, "已接收：" + Path.GetFileName(path));
+            _ = CheckUpdateAsync(current, peer.PeerId, path);
             if (!Visible) tray.ShowBalloonTip(2500, "收到文件", peer.PeerName + " → " + Path.GetFileName(path), ToolTipIcon.Info);
         });
         peer.Progress += progress => Ui(() => { if (network == current) ShowProgress(peer, progress); });
