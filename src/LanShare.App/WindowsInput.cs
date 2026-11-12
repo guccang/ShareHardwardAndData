@@ -15,6 +15,7 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
     private Rectangle bounds;
     private Rectangle[] monitors = [];
     private readonly PointerMotion motion = new();
+    private readonly SenderCursorWindow senderCursor = new();
     private SynchronizationContext? ui;
     private bool centering;
     // 标记本进程重放的事件，从钩子回调中识别自己的输入。
@@ -128,6 +129,13 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
 
     // 按会话切换本机设备监听，发送端只保留原有的钩子。
     public void SetReceiving(bool receiving) => localActivity?.SetReceiving(receiving);
+
+    // 系统继续提交移动，前后事件仍使用同一坐标系；仅控制端隐藏鼠标。
+    public bool SetSending(bool sending)
+    {
+        if (sending) return senderCursor.TryShow(bounds);
+        senderCursor.Dispose(); return true;
+    }
 
     // 被转发的修饰键没有进入本地异步键状态，需要同时检查已拦截的按下记录。
     private bool CtrlAltHeld() =>
@@ -270,6 +278,7 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
     // 关闭或锁屏后解除钩子并清空短期按下记录。
     public void Dispose()
     {
+        senderCursor.Dispose();
         localActivity?.Dispose(); localActivity = null;
         if (keyHook != 0) UnhookWindowsHookEx(keyHook);
         if (mouseHook != 0) UnhookWindowsHookEx(mouseHook);

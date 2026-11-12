@@ -70,6 +70,24 @@ internal static class AppSelfTest
             if (marker.Visible) throw new Exception("Remote pointer marker remained visible after return");
         }
         lines.Add("PASS: receiving cursor marker appears click-through and hides on return");
+        using (var sender = new SenderCursorWindow())
+        {
+            var area = Screen.PrimaryScreen!.WorkingArea;
+            var region = new Rectangle(area.Left + area.Width / 2, area.Top + area.Height / 2, 16, 16);
+            for (int trip = 0; trip < 2; trip++)
+            {
+                if (!sender.TryShow(region)) throw new Exception("Could not show the sender cursor window");
+                nint hwnd = sender.Handle;
+                DwmFlush();
+                var hit = WindowFromPoint(new Point(region.Left + 8, region.Top + 8));
+                var handled = SendMessage(hwnd, 0x0020, hwnd, 1);
+                if (GetForegroundWindow() == hwnd || hit != hwnd || handled != 1 || GetCursor() != 0)
+                    throw new Exception($"Sender cursor window failed: hover={hit == hwnd}, active={GetForegroundWindow() == hwnd}, hidden={GetCursor() == 0}");
+                sender.Dispose();
+                if (sender.Handle != 0 || GetCursor() == 0) throw new Exception("Source cursor did not recover");
+            }
+        }
+        lines.Add("PASS: sender window owns hover without activation, hides the cursor and restores it twice");
         using var bitmap = new Bitmap(8, 8);
         bitmap.SetPixel(3, 4, Color.FromArgb(128, 20, 100, 200));
         using var memory = new MemoryStream(); bitmap.Save(memory, ImageFormat.Png);
@@ -102,4 +120,14 @@ internal static class AppSelfTest
     // 从实际窗口句柄读取扩展样式，验证光标标记的点击穿透和不激活行为。
     [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     private static extern int GetWindowLong(nint window, int index);
+    // 验证发送端隐藏鼠标时不抢走前台窗口。
+    [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern nint GetForegroundWindow();
+    // 查询测试点实际命中的窗口。
+    [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern nint WindowFromPoint(Point point);
+    // 直接请求测试窗口设置客户区指针，不移动用户的实体鼠标。
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "SendMessageW")] private static extern nint SendMessage(nint window, uint msg, nint wParam, nint lParam);
+    // 读取本线程在进入和退出控制时设置的指针句柄。
+    [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern nint GetCursor();
+    // 等待桌面合成器完成显示后再验证命中位置。
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")] private static extern int DwmFlush();
 }

@@ -11,6 +11,8 @@ public interface IInputDesktop
     bool Inject(InputPacket packet);
     // 只在被控期间需要确认本机实体设备活动，发送端避免重复订阅鼠标事件。
     void SetReceiving(bool receiving) { }
+    // 发送端在进入远端控制时隐藏本机指针，返回时恢复；等待确认期间保持可见。
+    bool SetSending(bool sending) => true;
     // 系统暂时拒绝输入时，原生适配器可在普通桌面恢复后补送释放事件。
     void Release(InputPacket packet) => Inject(packet);
 }
@@ -66,7 +68,11 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
                 desktop.Release(Up(down));
         }
         held.Clear();
-        if (previous == ControlMode.Sending) desktop.Move(homeX, homeY);
+        if (previous == ControlMode.Sending)
+        {
+            desktop.SetSending(false);
+            desktop.Move(homeX, homeY);
+        }
         if (peer is not null) send(peer, new(InputOp.End, previousLease, (int)cause));
         Changed?.Invoke(reason);
     }
@@ -126,8 +132,11 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
             x = direction > 0 ? 1 : remoteWidth - 2;
             y = Pixel(fraction, remoteHeight);
             var (anchorX, anchorY) = desktop.Anchor;
+            if (!desktop.SetSending(true)) { ReturnLocal("无法隐藏本机指针，已取消切换"); return; }
+            if (Mode != ControlMode.Waiting) { desktop.SetSending(false); return; }
+            Mode = ControlMode.Sending;
             if (!desktop.Move(anchorX, anchorY)) { ReturnLocal("无法定位光标"); return; }
-            Mode = ControlMode.Sending; cooldown = now() + 250;
+            cooldown = now() + 250;
             Changed?.Invoke("正在控制");
             return;
         }

@@ -20,10 +20,12 @@ internal static class InputTests
         }
         var a = routers["A"]; var b = routers["B"]; var c = routers["C"];
         var target = desktops["B"];
+        var source = desktops["A"];
         var ctrl = new InputPacket(InputOp.Key, default, 162, 29);
         var leftDown = new InputPacket(InputOp.Button, default, 1, 1);
         PushEdge();
         check(a.Mode == ControlMode.Waiting && target.Events.Count == 0, "edge waits before intercepting");
+        check(!source.Hidden, "sender cursor stays visible pending approval");
         Dispatch();
         check(a.Mode == ControlMode.Local && b.Mode == ControlMode.Local, "data pairing does not grant input");
         allowed.Add(("B", "A")); allowed.Add(("C", "A"));
@@ -40,6 +42,7 @@ internal static class InputTests
         desktops["A"].Selecting = false;
         PushEdge(); Dispatch();
         check(a.Mode == ControlMode.Sending && b.Mode == ControlMode.Receiving && target.Position.X == 1, "grant activates both ends");
+        check(source.Hidden && !target.Hidden, "only the controlling desktop hides its cursor after grant");
         b.Receive("A", new(InputOp.Button, Guid.NewGuid(), 2, 1));
         check(target.Events.Count == 0, "wrong lease cannot operate remote desktop");
         foreach (int pressed in new[] { 1, 0, 1, 0 }) a.PhysicalEvent(leftDown with { B = pressed });
@@ -61,6 +64,7 @@ internal static class InputTests
         clock += 400; a.RemoteMotion(850, 0); Dispatch();
         check(a.Peer == "B" && target.Position.X == 99, "drag at far edge stays on same target");
         a.ReturnLocal("紧急返回"); Dispatch();
+        check(!source.Hidden, "emergency return restores sender cursor");
         check(target.Events.Count(p => p.Op == InputOp.Key && p.C == 1) == 1 && target.Events.Count(p => p.Op == InputOp.Button && p.B == 0) == 1, "emergency return releases held keys and mouse buttons");
         PushEdge(); Dispatch();
         target.Selecting = true; clock += 350; b.Tick(); Dispatch(); a.RemoteMotion(850, 0); Dispatch();
@@ -71,6 +75,7 @@ internal static class InputTests
         check(a.Peer == "B" && b.Mode == ControlMode.Receiving, "reverse direction through three computers");
         clock += 350; a.RemoteMotion(-250, 0); Dispatch();
         check(a.Mode == ControlMode.Local && desktops["A"].Position.X == 98, "cross adjacent edge back to source");
+        check(!source.Hidden, "crossing home restores sender cursor");
         for (int trip = 0; trip < 8; trip++)
         {
             PushEdge(); Dispatch();
@@ -89,10 +94,12 @@ internal static class InputTests
         Dispatch();
         check(a.Mode == ControlMode.Local && b.Mode == ControlMode.Local && target.Events.Last().C == 1, "target takeover releases modifier");
         check(reason == "对方的实体鼠标已接管", "controller receives remote takeover reason");
+        check(!source.Hidden, "target physical takeover also restores sender cursor");
         PushEdge(); Dispatch();
         a.PhysicalEvent(leftDown); Dispatch();
         clock += 1900; b.Tick(); packets.Clear(); a.Tick(); packets.Clear();
         check(a.Mode == ControlMode.Local && b.Mode == ControlMode.Local && target.Events.Last().B == 0, "heartbeat loss releases both ends without a network");
+        check(!source.Hidden, "timeout restores cursor without a reply from the receiver");
         a.Pointer(99, 50); a.Pointer(99, 50);
         check(a.Mode == ControlMode.Local, "return requires leaving the edge before another switch");
         PushEdge(); Dispatch();
@@ -102,6 +109,10 @@ internal static class InputTests
         check(a.Mode == ControlMode.Local, "disabled receiving side denies incoming request");
         b.Enable(true);
         check(a.Mode == ControlMode.Local && b.Mode == ControlMode.Local, "unlock does not resume previous control");
+        source.RefuseMove = true; PushEdge(); Dispatch();
+        check(!source.Hidden && a.Mode == ControlMode.Local && b.Mode == ControlMode.Local, "failed source positioning unwinds cursor hiding");
+        source.RefuseMove = false; PushEdge(); Dispatch(); a.Enable(false); Dispatch();
+        check(!source.Hidden && !a.Enabled, "disabling sharing restores the cursor");
 
         // 使用桌面左右位置计算邻居，模拟页面排列。
         string? Neighbor(string id, int side)
@@ -130,10 +141,14 @@ internal static class InputTests
         public bool PhysicalInputHeld { get; set; }
         public bool Selecting { get; set; }
         public bool RefuseKey { get; set; }
+        public bool RefuseMove { get; set; }
+        public bool Hidden { get; private set; }
+        // 记录发送端指针的可见状态。
+        public bool SetSending(bool sending) { Hidden = sending; return true; }
         public (int X, int Y) Position { get; private set; }
         public List<InputPacket> Events { get; } = [];
         // 模拟目标桌面的绝对定位。
-        public bool Move(int x, int y) { Position = (x, y); return true; }
+        public bool Move(int x, int y) { if (RefuseMove) return false; Position = (x, y); return true; }
         // 保存系统接收的事件，供释放及排序断言使用。
         public bool Inject(InputPacket packet)
         {
