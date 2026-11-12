@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 
 namespace LanShare.Core;
 
@@ -24,15 +25,20 @@ public readonly record struct InputPacket(InputOp Op, Guid Lease, int A = 0, int
         _ => false
     };
 
-    // 合并仍在队尾的相邻输入。小幅滚动最多合到单个刻度，保留余量、反转和横纵切换。
-    internal bool TryMergeTail(LinkedListNode<InputPacket>? tail)
+    // 只累计同一控制会话、同轴同方向的位移；换向或换轴立即开始新的滚动。
+    internal bool ContinuesWheel(InputPacket previous) =>
+        Op == InputOp.Wheel && previous.Op == InputOp.Wheel && Lease == previous.Lease &&
+        B == previous.B && A != 0 && Math.Sign(A) == Math.Sign(previous.A);
+
+    // 收端只合并一个刻度内的细分事件，发送端可以在一个采样窗口内累计多个刻度。
+    internal bool TryMergeTail(LinkedListNode<InputPacket>? tail, int wheelLimit = 120)
     {
         if (tail is null || tail.Value.Lease != Lease || tail.Value.Op != Op) return false;
         var previous = tail.Value;
         if (Op == InputOp.Move) { tail.Value = this; return true; }
-        if (Op != InputOp.Wheel || B != previous.B || A == 0 || Math.Sign(A) != Math.Sign(previous.A)) return false;
+        if (!ContinuesWheel(previous)) return false;
         long delta = (long)previous.A + A;
-        if (delta is < -120 or > 120) return false;
+        if (Math.Abs(delta) > wheelLimit) return false;
         tail.Value = this with { A = (int)delta };
         return true;
     }
@@ -59,6 +65,7 @@ public readonly record struct InputPacket(InputOp Op, Guid Lease, int A = 0, int
 // 每个已协商的 TLS 连接独立读写键鼠；网络读写不会发生在系统输入回调内。
 public sealed class InputLink(Stream stream) : IDisposable
 {
+    private const int WheelIntervalMs = 16, WheelBatchLimit = 8 * 120;
     private readonly LinkedList<InputPacket> queue = new();
     private readonly SemaphoreSlim available = new(0, 1);
     private readonly CancellationTokenSource stop = new();
@@ -67,16 +74,16 @@ public sealed class InputLink(Stream stream) : IDisposable
     public Func<InputPacket, Task>? Received { get; set; }
     public event Action? Closed;
 
-    // 队列从空变为非空时立即唤醒写线程；连续小幅滚动只合并尚未发送的部分。
+    // 新的独立事件唤醒写线程，以便按键等操作能提前结束滚轮采样；累加位移不会推迟期限。
     public bool TrySend(InputPacket packet)
     {
         lock (queue)
         {
             if (!IsOpen || !packet.Valid) return false;
-            if (packet.TryMergeTail(queue.Last)) return true;
+            if (packet.TryMergeTail(queue.Last, WheelBatchLimit)) return true;
             if (queue.Count >= 256) { _ = Task.Run(Dispose); return false; }
             queue.AddLast(packet);
-            if (queue.Count == 1) available.Release();
+            if (available.CurrentCount == 0) available.Release();
             return true;
         }
     }
@@ -98,32 +105,49 @@ public sealed class InputLink(Stream stream) : IDisposable
             }
             catch (Exception) { Dispose(); }
         });
-        _ = Task.Run(async () =>
+        _ = Task.Run(WriteLoopAsync);
+    }
+
+    // 首次滚动立即写出。同向后续滚动最多等一个窗口；有其他输入排在后面时按顺序立即发送。
+    private async Task WriteLoopAsync()
+    {
+        byte[] buffer = new byte[32 * InputPacket.Length];
+        InputPacket last = default;
+        long lastWrite = 0;
+        int wait = Timeout.Infinite;
+        try
         {
-            // 使用原有定长帧，只将已经就绪的输入一起写入 TLS，不等待凑批。
-            byte[] buffer = new byte[32 * InputPacket.Length];
-            try
+            while (IsOpen)
             {
-                while (IsOpen)
+                await available.WaitAsync(wait, stop.Token);
+                int bytes = 0;
+                lock (queue)
                 {
-                    await available.WaitAsync(stop.Token);
-                    int bytes = 0;
-                    lock (queue)
+                    if (!IsOpen) return;
+                    wait = Timeout.Infinite;
+                    long now = Stopwatch.GetTimestamp();
+                    while (queue.First is { } first && bytes < buffer.Length)
                     {
-                        if (!IsOpen) return;
-                        while (queue.First is { } first && bytes < buffer.Length)
+                        if (first.Next is null && first.Value.ContinuesWheel(last))
                         {
-                            first.Value.Encode(buffer.AsSpan(bytes, InputPacket.Length));
-                            bytes += InputPacket.Length;
-                            queue.RemoveFirst();
+                            double remaining = WheelIntervalMs - Stopwatch.GetElapsedTime(lastWrite, now).TotalMilliseconds;
+                            if (remaining > 0) { wait = (int)Math.Ceiling(remaining); break; }
                         }
-                        if (queue.Count != 0) available.Release();
+                        lastWrite = now;
+                        last = first.Value;
+                        last.Encode(buffer.AsSpan(bytes, InputPacket.Length));
+                        bytes += InputPacket.Length;
+                        queue.RemoveFirst();
                     }
-                    await stream.WriteAsync(buffer.AsMemory(0, bytes), stop.Token);
+                    if (queue.Count != 0 && wait == Timeout.Infinite) wait = 0;
                 }
+                if (bytes == 0) continue;
+                await stream.WriteAsync(buffer.AsMemory(0, bytes), stop.Token);
+                // 网络写入也消耗窗口时间；剩余尾帧按原期限重新计算等待时间。
+                if (wait > 0) wait = 0;
             }
-            catch (Exception) { Dispose(); }
-        });
+        }
+        catch (Exception) { Dispose(); }
     }
 
     // 只关闭此输入连接；控制器收到通知后释放本次远端按下的所有键。

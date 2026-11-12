@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -105,6 +106,66 @@ internal static class Program
         Throws<InvalidDataException>(() => PeerSession.ValidateClipboard("png", PeerSession.MaxImageBytes + 1L), "image size limit");
     }
 
+    // 累计滚动期间插入按键、移动、换轴、反转和切换会话，核对每道边界两侧的实际滚动量。
+    private static async Task CheckWheelBarriersAsync(InputLink sender, InputLink receiver, InputPacket wheel)
+    {
+        var key = new InputPacket(InputOp.Key, wheel.Lease, 17, 29);
+        var move = new InputPacket(InputOp.Move, wheel.Lease, 23, 46);
+        var end = new InputPacket(InputOp.End, Guid.NewGuid());
+        InputPacket[] input = [key, wheel, wheel, key with { C = 1 }, wheel, move,
+            wheel, wheel with { B = 0 }, wheel with { A = 3, B = 0 }, wheel with { Lease = end.Lease, A = 3, B = 0 },
+            wheel with { Lease = end.Lease, A = short.MinValue }, end];
+        var actual = new List<InputPacket>();
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        receiver.Received = packet =>
+        {
+            actual.Add(packet);
+            if (packet == end) completed.SetResult();
+            return Task.CompletedTask;
+        };
+        foreach (var packet in input)
+            if (!sender.TrySend(packet)) throw new Exception("Wheel barrier could not be queued");
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        // 两个相邻整格可以分包也可以合包，其余边界必须逐条相同。
+        if (actual.Count > 2 && actual[1] == wheel && actual[2] == wheel)
+        {
+            actual[1] = wheel with { A = 2 * wheel.A };
+            actual.RemoveAt(2);
+        }
+        Check(actual.SequenceEqual(input.Take(1).Append(wheel with { A = 2 * wheel.A }).Concat(input.Skip(3))),
+            "wheel batching respects modifier, move, axis, reversal, lease and end barriers over TLS");
+    }
+
+    // 在真实 TLS 上每两毫秒发送一个滚轮样本，直到尾部余量独立送达，统计对端实际收到的帧。
+    private static async Task CheckPacedWheelAsync(InputLink sender, InputLink receiver, InputPacket wheel)
+    {
+        const int samples = 240;
+        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int frames = 0, total = 0;
+        receiver.Received = packet =>
+        {
+            if (packet.Op != InputOp.Wheel || packet.Lease != wheel.Lease || packet.B != wheel.B ||
+                Math.Sign(packet.A) != Math.Sign(wheel.A) || Math.Abs(packet.A) > 8 * 120)
+                done.TrySetException(new Exception("Unexpected paced wheel frame"));
+            frames++;
+            total += packet.A;
+            if (Math.Abs(total) >= samples * Math.Abs(wheel.A)) done.TrySetResult();
+            return Task.CompletedTask;
+        };
+        await Task.Run(() =>
+        {
+            for (int i = 0; i < samples; i++)
+            {
+                if (!sender.TrySend(wheel)) throw new Exception("Paced wheel queue closed");
+                long start = Stopwatch.GetTimestamp();
+                while (Stopwatch.GetElapsedTime(start).TotalMilliseconds < 2) Thread.Yield();
+            }
+        });
+        await done.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Console.WriteLine($"  Wheel delta {wheel.A}: {samples} samples -> {frames} TLS input frames, total {total}");
+        Check(total == samples * wheel.A && frames < samples / 2, "paced wheel preserves distance and halves received frame count");
+    }
+
     // 真实双向 TLS 验证确认前隔离、双方同意、持久信任、冒充拒绝及取消。
     private static async Task PairingTestsAsync(string root)
     {
@@ -161,6 +222,10 @@ internal static class Program
             if (!inputSender.TrySend(packet)) throw new Exception("Wheel burst could not be queued");
         await finished.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Check(delivered.SequenceEqual(burst), "real TLS delivers full detents across batches and the following key in order");
+
+        await CheckWheelBarriersAsync(inputSender, restoredB.Sessions.Single().Input!, wheel);
+        await CheckPacedWheelAsync(inputSender, restoredB.Sessions.Single().Input!, wheel with { A = 120, B = 0 });
+        await CheckPacedWheelAsync(inputSender, restoredB.Sessions.Single().Input!, wheel with { A = -3, B = 1 });
 
         using var strangerIdentity = Security.CreateCertificate();
         using var stranger = new PeerNetwork(strangerIdentity, root, port: FreePort());
