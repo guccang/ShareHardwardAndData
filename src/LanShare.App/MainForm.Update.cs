@@ -7,6 +7,7 @@ internal sealed partial class MainForm
 {
     private readonly SemaphoreSlim updateGate = new(1);
     private bool updateStarted;
+    internal string? ArmedUpdateStage { get; private set; }
     internal Action? AfterRuntimeReady { get; set; }
 
     // 发送端保留对方已确认的文件摘要；接收端已在落盘前核对过摘要。
@@ -60,6 +61,7 @@ internal sealed partial class MainForm
             updateStarted = true;
             try { await Task.Run(() => PortableUpdate.Arm(stage)); }
             catch { updateStarted = false; throw; }
+            ArmedUpdateStage = stage;
             stage = null; // 助手已接手暂存目录，等待当前实例正常退出。
             Log("软件更新", "新版已验证，正在原目录安装并重启。");
             ExitApplication();

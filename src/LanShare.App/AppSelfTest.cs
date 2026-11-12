@@ -24,6 +24,10 @@ internal static class AppSelfTest
         using var restoredIdentity = restored.ReadIdentity();
         if (Security.Fingerprint(identity) != Security.Fingerprint(restoredIdentity)) throw new Exception("Identity persistence failed");
         lines.Add("PASS: DPAPI-protected identity survives settings roundtrip");
+        CheckInstanceLock();
+        lines.Add("PASS: retained unlocked or abandoned mutex permits restart, live owner prevents duplicates");
+        CheckInputShutdown();
+        lines.Add("PASS: blocked input thread does not block shutdown request; queued cleanup runs once");
         using (var loop = new InputMessageLoop())
         {
             var tested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -147,6 +151,8 @@ internal static class AppSelfTest
         if (form.IsDisposed || form.Visible) throw new Exception("Close must hide to tray without disposal");
         lines.Add("PASS: window close keeps application alive in tray");
         form.ExitApplication();
+        var closeDeadline = Environment.TickCount64 + 5000;
+        while (!form.IsDisposed && Environment.TickCount64 < closeDeadline) { Application.DoEvents(); Thread.Sleep(5); }
         if (!form.IsDisposed) throw new Exception("Explicit tray exit must dispose window");
         lines.Add("PASS: explicit tray exit disposes application");
         lines.Add("PASS: WinForms layout and clipboard listener initialization");
@@ -199,6 +205,44 @@ internal static class AppSelfTest
             Drain();
         });
         finished.Task.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+    }
+
+    // 用另一个线程模拟活动实例和异常退出，保留旧句柄时也按所有权判定。
+    private static void CheckInstanceLock()
+    {
+        string name = @"Local\SimpleLanShare.Test." + Guid.NewGuid().ToString("N");
+        using var retained = new Mutex(false, name);
+        using var next = Mutex.OpenExisting(name);
+        if (!Program.TryOwnInstance(next)) throw new Exception("Stale mutex handle prevented launch");
+        next.ReleaseMutex();
+        using var owned = new ManualResetEventSlim();
+        using var leave = new ManualResetEventSlim();
+        var owner = new Thread(() => { retained.WaitOne(); owned.Set(); leave.Wait(); });
+        owner.Start(); owned.Wait();
+        try { if (Program.TryOwnInstance(next)) throw new Exception("Duplicate instance accepted"); }
+        finally { leave.Set(); owner.Join(); }
+        if (!Program.TryOwnInstance(next)) throw new Exception("Abandoned mutex prevented launch");
+        next.ReleaseMutex();
+    }
+
+    // 阻塞模拟输入线程，确认 UI 调用停机可立即返回，解除阻塞后仍完整清理。
+    private static void CheckInputShutdown()
+    {
+        using var loop = new InputMessageLoop();
+        using var started = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        int cleanups = 0;
+        loop.Post(() => { started.Set(); release.Wait(TimeSpan.FromSeconds(5)); });
+        started.Wait();
+        try
+        {
+            var stopped = loop.StopAsync(() => cleanups++);
+            if (stopped.IsCompleted || stopped != loop.StopAsync()) throw new Exception("Input shutdown did not yield");
+            release.Set();
+            stopped.WaitAsync(TimeSpan.FromSeconds(3)).GetAwaiter().GetResult();
+            if (cleanups != 1) throw new Exception("Input cleanup was skipped or repeated");
+        }
+        finally { release.Set(); }
     }
 
 }

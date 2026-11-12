@@ -42,6 +42,7 @@ internal sealed partial class MainForm : Form
     private PeerNetwork? network;
     private ClipboardContent? latestClipboard;
     private bool broadcasting, shuttingDown, exitRequested, closeHintShown;
+    private bool closingInput, closeReady;
     private readonly Icon appIcon = LoadAppIcon();
     private readonly bool smoke;
     private readonly string baseTitle = "局域共享 · Simple LAN Share";
@@ -643,6 +644,11 @@ internal sealed partial class MainForm : Form
     // 点击关闭只隐藏到托盘；托盘退出、系统关机和自检模式才真正释放资源。
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        if (closingInput)
+        {
+            e.Cancel = !closeReady;
+            base.OnFormClosing(e); return;
+        }
         if (!exitRequested && e.CloseReason == CloseReason.UserClosing)
         {
             e.Cancel = true; Hide();
@@ -655,6 +661,7 @@ internal sealed partial class MainForm : Form
             if (!closingRecording) { closingRecording = true; shuttingDown = true; _ = FinishRecordingAndExitAsync(); }
             base.OnFormClosing(e); return;
         }
+        closingInput = true;
         shuttingDown = true;
         if (!smoke)
         {
@@ -667,8 +674,19 @@ internal sealed partial class MainForm : Form
         explorerStop.Cancel();
         recordingTimer.Dispose(); recording.Dispose();
         screenshotHotkey.Dispose(); recordingHotkey.Dispose(); screenshots.Dispose(); StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
-        input.Dispose();
+        e.Cancel = true;
+        _ = FinishInputAndExitAsync();
         base.OnFormClosing(e);
+    }
+
+    // 等待正常释放按键时保持主窗口消息循环可用。系统输入调用卡住时仍完成退出交接。
+    private async Task FinishInputAndExitAsync()
+    {
+        var stopped = input.StopAsync();
+        await Task.Yield(); // 先结束当前的 FormClosing 回调，再发起最终关闭。
+        await Task.WhenAny(stopped, Task.Delay(TimeSpan.FromSeconds(3)));
+        closeReady = true;
+        if (!IsDisposed) Close();
     }
 
     // 托盘明确退出才结束后台共享；自检也使用相同的资源回收入口。

@@ -76,8 +76,8 @@ internal static class Program
             }
         }
         // 关闭到托盘后再次运行同一软件只恢复已有窗口，避免端口和身份配置冲突。
-        using var instance = new Mutex(true, "Local\\SimpleLanShare.Desktop", out bool firstInstance);
-        if (!firstInstance)
+        using var instance = new Mutex(false, "Local\\SimpleLanShare.Desktop");
+        if (!TryOwnInstance(instance))
         {
             if (request is not null)
             {
@@ -89,6 +89,7 @@ internal static class Program
             if (!args.Contains("--background", StringComparer.OrdinalIgnoreCase) && args.FirstOrDefault() != "--updated" && window != IntPtr.Zero) PostMessage(window, 0x8201, IntPtr.Zero, IntPtr.Zero);
             return;
         }
+        string? releaseStage = null;
         Application.ThreadException += (_, e) => MessageBox.Show(e.Exception.Message, "局域共享", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         try
         {
@@ -96,9 +97,21 @@ internal static class Program
             if (args is ["--updated", var stage, var worker] && int.TryParse(worker, out int workerId))
                 form.AfterRuntimeReady = () => PortableUpdate.Started(stage, workerId);
             Application.Run(form);
+            releaseStage = form.ArmedUpdateStage;
         }
-        finally { instance.ReleaseMutex(); }
+        finally
+        {
+            instance.ReleaseMutex();
+            if (releaseStage is not null) PortableUpdate.NotifyReleased(releaseStage);
+        }
     }
+    // 只有仍被别的线程持有的锁才代表活动实例，保留的旧句柄和异常退出都允许重启。
+    internal static bool TryOwnInstance(Mutex instance)
+    {
+        try { return instance.WaitOne(0); }
+        catch (AbandonedMutexException) { return true; }
+    }
+
     // 命令行助手没有主窗体，直接向发起操作的用户展示失败原因。
     private static void ShowShellError(string message, Exception ex)
     {

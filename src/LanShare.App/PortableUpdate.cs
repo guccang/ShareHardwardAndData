@@ -44,8 +44,10 @@ internal static class PortableUpdate
         var previousVersion = FileVersionInfo.GetVersionInfo(target).ProductVersion?.Split('+')[0];
         if (!Version.TryParse(previousVersion, out var old) || Version.Parse(release.Version) <= old)
             throw new InvalidDataException("更新版本未高于已安装版本。");
+        using var released = new EventWaitHandle(false, EventResetMode.ManualReset, EventName(stage, "released"));
         using (var armed = EventWaitHandle.OpenExisting(EventName(stage, "armed"))) armed.Set();
-        if (!parent.WaitForExit(120000)) throw new IOException("等待原程序退出超时。");
+        if (WaitReady(released, parent, 120)) parent.WaitForExit(1500); // 给正常退出的映像一小段卸载时间。
+        else if (!parent.HasExited) throw new IOException("等待原程序退出超时。");
         try
         {
             Install(stage, () => StartAndCheck(target, stage));
@@ -56,6 +58,13 @@ internal static class PortableUpdate
             if (File.Exists(target)) Start(target, "--background").Dispose();
             throw;
         }
+    }
+
+    // 主窗体已关闭、设置已保存且单实例锁已释放，此时允许助手接手原目录。
+    internal static void NotifyReleased(string stage)
+    {
+        if (EventWaitHandle.TryOpenExisting(EventName(stage, "released"), out var released))
+            using (released) released.Set();
     }
 
     // 每个文件单独原子替换。写入或启动失败时按逆序恢复已完成的更改。

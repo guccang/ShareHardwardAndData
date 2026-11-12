@@ -3,7 +3,7 @@ using LanShare.Core;
 namespace LanShare.App;
 
 // 主窗口只提交设置快照和读取状态。所有钩子、输入包和会话状态均在键鼠线程处理。
-internal sealed class InputRuntime : IDisposable
+internal sealed class InputRuntime
 {
     internal sealed record Status(ControlMode Mode, string? Peer, bool Enabled);
     private readonly InputMessageLoop loop = new();
@@ -135,12 +135,8 @@ internal sealed class InputRuntime : IDisposable
     }
 
     // 先释放按下状态及两端指针窗口，再退出键鼠线程。
-    public void Dispose()
+    internal Task StopAsync() => loop.StopAsync(() =>
     {
-        loop.Post(() =>
-        {
-            loop.SetClock(null); router.Enable(false); desktop.Dispose(); marker?.Dispose(); marker = null;
-        });
-        loop.Dispose();
-    }
+        loop.SetClock(null); router.Enable(false); desktop.Dispose(); marker?.Dispose(); marker = null;
+    });
 }

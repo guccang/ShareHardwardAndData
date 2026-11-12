@@ -5,6 +5,7 @@ internal sealed class InputMessageLoop : IDisposable
 {
     private readonly TaskCompletionSource<Control> ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Thread thread;
+    private readonly TaskCompletionSource stopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object gate = new();
     private readonly System.Threading.Timer timer;
     private Action? tick;
@@ -31,6 +32,7 @@ internal sealed class InputMessageLoop : IDisposable
             Application.Run();
         }
         catch (Exception ex) when (ready.TrySetException(ex)) { }
+        finally { stopped.TrySetResult(); }
     }
 
     // 按投递顺序执行；关闭期间让网络队列走已有的断开处理。
@@ -68,17 +70,21 @@ internal sealed class InputMessageLoop : IDisposable
     }
 
     // 让先前提交的清理工作执行完，再结束本线程的消息循环。
-    public void Dispose()
+    internal Task StopAsync(Action? cleanup = null)
     {
         lock (gate)
         {
-            if (closed) return;
+            if (closed) return stopped.Task;
             closed = true;
             ready.Task.GetAwaiter().GetResult().BeginInvoke(new Action(() =>
             {
-                tick = null; timer.Dispose(); Application.ExitThread();
+                try { cleanup?.Invoke(); }
+                finally { tick = null; timer.Dispose(); Application.ExitThread(); }
             }));
         }
-        thread.Join();
+        return stopped.Task;
     }
+
+    // 独立测试循环可以同步回收；主窗体退出使用异步停机以保持消息响应。
+    public void Dispose() => StopAsync().GetAwaiter().GetResult();
 }
