@@ -16,6 +16,7 @@ internal sealed class AppSettings
     public bool ClipboardEnabled { get; set; } = true;
     public bool AutoAccept { get; set; } = true;
     public bool LaunchAtLogin { get; set; } = true;
+    public bool AdminAtLogin { get; set; }
     public bool ExplorerMenuEnabled { get; set; } = true;
     public bool InputEnabled { get; set; }
     public List<string> InputOrder { get; set; } = [];

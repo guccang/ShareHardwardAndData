@@ -1,4 +1,4 @@
-# 局域共享 · Simple LAN Share 0.6.7
+# 局域共享 · Simple LAN Share 0.6.8
 
 在同一局域网的多台 Windows 电脑之间共享一套键盘和鼠标、同步文字和图片剪贴板、拖拽传文件。
 
@@ -46,7 +46,11 @@
 
 首次运行新版默认开启**开机自启动**：当前用户登录 Windows 后直接在托盘运行，自动连接已配对且在线的电脑，无需再次确认。可以在主窗口或托盘菜单取消“开机自启动”。手动运行程序同样默认后台启动；使用 `SimpleLanShare.exe --show` 可直接打开窗口。
 
-启动项保存在当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，不需要管理员权限。请先把便携版放到固定目录再运行；移动目录或升级后运行一次新版会更新启动路径。删除软件前可先取消自启动。系统任务管理器禁用启动项后，需要在那里重新启用。
+受控电脑需要经常操作任务管理器或其他管理员窗口时，可在该电脑托盘退出旧实例，将完整发布包解压到 `C:\Program Files\SimpleLanShare`，从该目录运行，在**设置**中勾选**登录时以管理员身份运行**。使用当前登录的管理员账号确认 Windows 授权。下次该账号登录时，计划任务会在其交互桌面以最高权限运行局域共享，直接进入托盘，按原有配对自动连接。在“键鼠共享”页可以查看本次运行权限。
+
+取消管理员选项会切回普通登录启动，取消“开机自启动”会同时移除管理员登录任务。管理员模式使用当前用户专属任务，路径保持固定，后续签名更新仍在同一目录生效。
+
+普通模式的启动项保存在当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，不需要管理员权限。请先把便携版放到固定目录再运行；移动目录或升级后运行一次新版会更新启动路径。删除软件前可先取消自启动。系统任务管理器禁用启动项后，需要在那里重新启用。
 
 ## 截图与共享
 
@@ -123,7 +127,7 @@ Windows 上安装 .NET 8 SDK 或可构建 .NET 8 的更新 SDK：
 .\scripts\build.ps1
 ```
 
-生成 `artifacts\SimpleLanShare-0.6.7-win-x64\SimpleLanShare.exe` 和同名 ZIP。首次构建需要下载微软运行时包，没有第三方 NuGet 依赖。已有缓存时可用 `scripts/build.ps1 -Offline` 离线发布。开发时可直接打开窗口。
+生成 `artifacts\SimpleLanShare-0.6.8-win-x64\SimpleLanShare.exe` 和同名 ZIP。首次构建需要下载微软运行时包，没有第三方 NuGet 依赖。已有缓存时可用 `scripts/build.ps1 -Offline` 离线发布。开发时可直接打开窗口。
 
 ```powershell
 dotnet run --project src\LanShare.App\LanShare.App.csproj -- --show

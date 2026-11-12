@@ -10,10 +10,38 @@ internal static class DesktopFeatureTests
     {
         var results = new List<string>();
         CheckStartup(results);
+        CheckAdminLogin(results);
         CheckScreenshotPixels(directory, results);
         CheckHotkeys(results);
         CheckHiddenStartup(results);
         return results;
+    }
+
+    // 让 Windows 自己解析任务定义，覆盖登录主体、最高权限和托盘参数，不创建实际启动任务。
+    private static void CheckAdminLogin(List<string> results)
+    {
+        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+        string sid = identity.User!.Value;
+        string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "SimpleLanShare", UpdatePackage.Exe);
+        string xml = AdminLoginTask.Definition(sid, exe);
+        dynamic service = Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service", true)!)!;
+        service.Connect();
+        dynamic definition = service.NewTask(0);
+        definition.XmlText = xml;
+        dynamic trigger = definition.Triggers.Item(1), action = definition.Actions.Item(1);
+        // COM 读取时可能把域 SID 规范化为用户名，注册用的 XML 中应始终保留原始 SID。
+        var users = System.Xml.Linq.XElement.Parse(xml).Descendants().Where(e => e.Name.LocalName == "UserId").Select(e => e.Value).ToArray();
+        Assert((int)trigger.Type == 9 && users.SequenceEqual(new[] { sid, sid }) && (string)trigger.UserId == (string)definition.Principal.UserId
+            && (int)definition.Principal.LogonType == 3 && (int)definition.Principal.RunLevel == 1,
+            "Scheduler parses current-user interactive logon with highest privileges", results);
+        Assert((string)action.Path == exe && (string)action.Arguments == "--background"
+            && (string)action.WorkingDirectory == Path.GetDirectoryName(exe) && (string)definition.Settings.ExecutionTimeLimit == "PT0S"
+            && !(bool)definition.Settings.DisallowStartIfOnBatteries && !(bool)definition.Settings.StopIfGoingOnBatteries,
+            "administrator logon action keeps the tray app running across battery and long sessions", results);
+        bool blocked = false;
+        try { AdminLoginTask.CheckLocation(Path.Combine(Path.GetTempPath(), UpdatePackage.Exe)); }
+        catch (InvalidOperationException) { blocked = true; }
+        Assert(blocked, "administrator autostart rejects user-writable portable location", results);
     }
 
     // 真实注册表读写只作用于本次唯一测试子键，验证启用、升级路径和移除。

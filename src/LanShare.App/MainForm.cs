@@ -19,6 +19,8 @@ internal sealed partial class MainForm : Form
     private readonly Button recordButton = MakeButton("区域录屏", width: 115);
     private readonly System.Windows.Forms.Timer recordingTimer = new() { Interval = 1000 };
     private bool closingRecording;
+    private readonly CheckBox adminLogin = new() { Text = "登录时以管理员身份运行", AutoSize = true };
+    private bool adminLoginActive, changingLogin;
     private readonly CheckBox startup = new() { Text = "开机自启动（后台）", AutoSize = true };
     private readonly Button captureButton = MakeButton("截图 Ctrl+Alt+A", width: 180);
     private bool suppressFirstShow, runtimeInitialized, updatingStartup, shortcutSettingsOpen;
@@ -70,7 +72,8 @@ internal sealed partial class MainForm : Form
         clipboard = new ClipboardBridge();
         clipboard.Changed += content => { latestClipboard = content; _ = BroadcastClipboardAsync(); };
         clipboard.Notice += text => { detail.Text = text; };
-        startup.CheckedChanged += (_, _) => ChangeStartupSetting();
+        startup.CheckedChanged += async (_, _) => await ChangeStartupAsync(startup.Checked, startup.Checked && adminLoginActive);
+        adminLogin.CheckedChanged += async (_, _) => await ChangeStartupAsync(adminLogin.Checked || startup.Checked, adminLogin.Checked);
         captureButton.Click += async (_, _) => await CaptureScreenshotAsync();
         screenshotHotkey.Pressed += async () => { if (input.Current.Mode != ControlMode.Sending) await CaptureScreenshotAsync(); };
         recordButton.Click += async (_, _) => await ToggleRecordingAsync();
@@ -108,7 +111,7 @@ internal sealed partial class MainForm : Form
             recordItem.Text = recording.IsStopping ? "正在保存录屏…" : recording.IsBusy ? "停止录屏并保存" : "区域录屏 (" + recordingHotkey.Label + ")";
             recordItem.Enabled = !shuttingDown && !screenshots.IsCapturing && !shortcutSettingsOpen && !recording.IsStopping;
             videoItem.Enabled = recording.LastVideo is not null;
-            lastItem.Enabled = screenshots.HasImage; updatingStartup = true; startupItem.Checked = startup.Checked; updatingStartup = false;
+            lastItem.Enabled = screenshots.HasImage; startupItem.Enabled = !changingLogin; updatingStartup = true; startupItem.Checked = startup.Checked; updatingStartup = false;
         };
         trayMenu.Items.Add("退出", null, (_, _) => ExitApplication());
         tray.ContextMenuStrip = trayMenu;
@@ -137,7 +140,16 @@ internal sealed partial class MainForm : Form
         if (runtimeInitialized || shuttingDown) return;
         runtimeInitialized = true;
         if (smoke) { AfterRuntimeReady?.Invoke(); return; }
-        try { StartupRegistration.SetEnabled(settings.LaunchAtLogin, StartupRegistration.CurrentCommand()); settings.Save(); }
+        try
+        {
+            adminLoginActive = settings.AdminAtLogin;
+            try { settings.AdminAtLogin = adminLoginActive = AdminLoginTask.Registered(); }
+            catch (Exception ex) { Log("自启动", "无法读取计划任务，沿用上次启动方式：" + ex.Message); }
+            if (adminLoginActive) settings.LaunchAtLogin = true;
+            ShowLoginSettings();
+            StartupRegistration.SetEnabled(settings.LaunchAtLogin && !adminLoginActive, StartupRegistration.CurrentCommand());
+            settings.Save();
+        }
         catch (Exception ex) { Log("自启动设置失败", ex.Message); tray.ShowBalloonTip(3000, "自启动设置失败", "可打开窗口重新设置：" + ex.Message, ToolTipIcon.Warning); }
         ApplyExplorerMenu();
         _ = ListenForExplorerAsync();
@@ -149,22 +161,42 @@ internal sealed partial class MainForm : Form
         AfterRuntimeReady?.Invoke();
     }
 
-    // 用户选项立即写入当前用户启动项，失败时恢复界面和先前配置。
-    private void ChangeStartupSetting()
+    // 两个开关及托盘菜单共用同一登录模式；刷新控件不会再次申请授权。
+    private void ShowLoginSettings()
     {
-        if (smoke || updatingStartup) return;
+        updatingStartup = true;
+        try { startup.Checked = settings.LaunchAtLogin; adminLogin.Checked = adminLoginActive; }
+        finally { updatingStartup = false; }
+    }
+
+    // 普通 Run 项与管理员登录任务互斥，取消 UAC 或注册失败时恢复原设置。
+    private async Task ChangeStartupAsync(bool enabled, bool elevated)
+    {
+        if (smoke || updatingStartup || changingLogin) return;
         bool previous = settings.LaunchAtLogin;
+        changingLogin = true; startup.Enabled = adminLogin.Enabled = false;
         try
         {
-            StartupRegistration.SetEnabled(startup.Checked, StartupRegistration.CurrentCommand());
-            settings.LaunchAtLogin = startup.Checked; settings.Save();
-            Log("自启动", startup.Checked ? "已开启：登录 Windows 后在托盘运行并自动连接" : "已关闭开机自启动");
+            settings.LaunchAtLogin = enabled; settings.AdminAtLogin = elevated;
+            settings.Save();
+            StartupRegistration.SetEnabled(enabled && !elevated, StartupRegistration.CurrentCommand());
+            if (adminLoginActive != elevated) await AdminLoginTask.ChangeAsync(elevated);
+            adminLoginActive = elevated;
+            Log("自启动", elevated ? "下次登录将以管理员身份启动到托盘并自动连接" :
+                enabled ? "下次登录将以普通方式启动到托盘" : "已关闭登录自启动");
         }
         catch (Exception ex)
         {
-            settings.LaunchAtLogin = previous; updatingStartup = true; startup.Checked = previous; updatingStartup = false;
-            try { StartupRegistration.SetEnabled(previous, StartupRegistration.CurrentCommand()); } catch { }
-            Log("自启动设置失败", ex.Message);
+            settings.LaunchAtLogin = previous; settings.AdminAtLogin = adminLoginActive;
+            try { StartupRegistration.SetEnabled(previous && !adminLoginActive, StartupRegistration.CurrentCommand()); settings.Save(); }
+            catch (Exception rollback) { Log("自启动设置恢复失败", rollback.Message); }
+            Log("自启动设置", ex.Message);
+            if (ex is not OperationCanceledException) MessageBox.Show(this, ex.Message, "自启动设置", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        finally
+        {
+            changingLogin = false; startup.Enabled = adminLogin.Enabled = true;
+            ShowLoginSettings();
         }
     }
 

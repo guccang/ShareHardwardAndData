@@ -10,6 +10,13 @@ internal static class Program
     private static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
+        // 配置助手直接在获得 UAC 授权后运行，不进入主实例及网络启动流程。
+        if (args is ["--configure-admin-login", var mode, var sid] && mode is "enable" or "disable")
+        {
+            try { AdminLoginTask.Configure(mode == "enable", sid); }
+            catch (Exception ex) { ShowShellError("管理员登录任务设置失败。", ex); }
+            return;
+        }
         if (args is ["--apply-update", var pid, var ticks] && int.TryParse(pid, out int parent) && long.TryParse(ticks, out long started))
         {
             try { PortableUpdate.RunWorker(parent, started); }
