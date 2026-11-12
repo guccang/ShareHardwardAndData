@@ -10,6 +10,8 @@ public interface IInputDesktop
     // 前台窗口的完整性高于接收进程时，普通桌面输入无法可靠送达。
     bool ForegroundHasHigherIntegrity => false;
     bool Move(int x, int y);
+    // 主控端回中和恢复光标只调整本机位置，默认适配器沿用普通移动。
+    bool MoveLocal(int x, int y) => Move(x, y);
     bool Inject(InputPacket packet);
     // 只在被控期间需要确认本机实体设备活动，发送端避免重复订阅鼠标事件。
     void SetReceiving(bool receiving) { }
@@ -74,7 +76,7 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
         if (previous == ControlMode.Sending)
         {
             desktop.SetSending(false);
-            desktop.Move(homeX, homeY);
+            desktop.MoveLocal(homeX, homeY);
         }
         if (peer is not null) send(peer, new(InputOp.End, previousLease, (int)cause));
         Changed?.Invoke(reason);
@@ -146,7 +148,7 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
             if (!desktop.SetSending(true)) { ReturnLocal("无法隐藏本机指针，已取消切换"); return; }
             if (Mode != ControlMode.Waiting) { desktop.SetSending(false); return; }
             Mode = ControlMode.Sending;
-            if (!desktop.Move(anchorX, anchorY)) { ReturnLocal("无法定位光标"); return; }
+            if (!desktop.MoveLocal(anchorX, anchorY)) { ReturnLocal("无法定位光标"); return; }
             cooldown = now() + 250;
             Changed?.Invoke("正在控制");
             return;
@@ -230,7 +232,7 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
                 int heightFraction = Fraction(y, remoteHeight);
                 ReturnLocal("切换电脑");
                 if (next == localId)
-                    desktop.Move(side < 0 ? desktop.Width - 2 : 1, Pixel(heightFraction, desktop.Height));
+                    desktop.MoveLocal(side < 0 ? desktop.Width - 2 : 1, Pixel(heightFraction, desktop.Height));
                 else Request(next, side, heightFraction);
                 return;
             }

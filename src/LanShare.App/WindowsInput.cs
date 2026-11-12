@@ -216,7 +216,7 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
             centering = false;
             if (Router?.Mode != ControlMode.Sending) return;
             var (x, y) = Anchor;
-            if (!Move(x, y)) Router.ReturnLocal("无法定位本机光标");
+            if (!MoveLocal(x, y)) Router.ReturnLocal("无法定位本机光标");
         }, null);
     }
 
@@ -236,6 +236,19 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
         }
         return nearest;
     }
+
+    // 主控端定位不生成 SendInput 回放，先对齐位移基线以免回中被转发到远端。
+    public bool MoveLocal(int x, int y)
+    {
+        var point = VisiblePoint(new Point(bounds.Left + x, bounds.Top + y), monitors);
+        motion.Observe(point, positioning: true);
+        if (SetCursorPos(point.X, point.Y)) return true;
+        motion.Observe(Cursor.Position, positioning: true);
+        return false;
+    }
+
+    // 本机指针使用物理屏幕坐标定位，跨屏回中时不进入系统注入队列。
+    [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
 
     // 使用各显示器的实际像素和完整虚拟桌面原点进行绝对定位。
     public bool Move(int x, int y)

@@ -43,6 +43,7 @@ internal static class InputTests
         desktops["A"].Selecting = false;
         PushEdge(); Dispatch();
         check(a.Mode == ControlMode.Sending && b.Mode == ControlMode.Receiving && target.Position.X == 1, "grant activates both ends");
+        check(source.LocalMoves == 1 && target.LocalMoves == 0, "sender recenters through local positioning; receiver still uses replay");
         check(source.Hidden && !target.Hidden, "only the controlling desktop hides its cursor after grant");
         b.Receive("A", new(InputOp.Button, Guid.NewGuid(), 2, 1));
         check(target.Events.Count == 0, "wrong lease cannot operate remote desktop");
@@ -178,6 +179,9 @@ internal static class InputTests
         public bool Selecting { get; set; }
         public bool RefuseKey { get; set; }
         public bool RefuseMove { get; set; }
+        public int LocalMoves { get; private set; }
+        // 计数主控端本地定位，区分跨屏回中和受控端鼠标回放。
+        public bool MoveLocal(int x, int y) { LocalMoves++; return Move(x, y); }
         public bool ForegroundHasHigherIntegrity { get; set; }
         public bool Hidden { get; private set; }
         // 记录发送端指针的可见状态。
