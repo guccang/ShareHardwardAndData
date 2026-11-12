@@ -18,6 +18,7 @@ internal sealed class AppSettings
     public bool LaunchAtLogin { get; set; } = true;
     public bool InputEnabled { get; set; }
     public List<string> InputOrder { get; set; } = [];
+    public DesktopLayout? SharedLayout { get; set; }
     public List<string> InputAllowed { get; set; } = [];
     public Dictionary<string, string> InputNames { get; set; } = [];
     public Keys InputReturnKey { get; set; } = Keys.Home;
@@ -46,6 +47,7 @@ internal sealed class AppSettings
         TrustedDeviceIds ??= [];
         InputAllowed ??= []; InputOrder ??= []; InputNames ??= [];
         InputAllowed.RemoveAll(id => !TrustedDeviceIds.Contains(id));
+        if (SharedLayout?.IsValid() != true) SharedLayout = null;
         try
         {
             if (!string.IsNullOrEmpty(ProtectedIdentity))
@@ -62,7 +64,7 @@ internal sealed class AppSettings
         }
         catch (Exception ex) when (ex is CryptographicException or FormatException or System.ComponentModel.Win32Exception) { }
         TrustedDeviceIds.Clear();
-        InputAllowed.Clear(); InputOrder.Clear(); InputNames.Clear();
+        InputAllowed.Clear(); InputOrder.Clear(); InputNames.Clear(); SharedLayout = null;
         var fresh = Security.CreateCertificate();
         byte[] pfx = fresh.Export(X509ContentType.Pfx);
         try { ProtectedIdentity = Protect(Convert.ToBase64String(pfx), false); }

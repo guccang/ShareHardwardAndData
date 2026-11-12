@@ -51,7 +51,8 @@ public static class Wire
 public sealed record Frame(byte Kind, byte[] Data);
 public sealed record Hello(string Channel, string Token, string Name, int Version = 2, string NodeId = "", int InputVersion = 0);
 public sealed record Ready(string Token, string Name, int Version = 2, string NodeId = "", int InputVersion = 0);
-public sealed record Message(string Kind, string Id = "", string Text = "", long Size = 0, string Hash = "");
+public sealed record Message(string Kind, string Id = "", string Text = "", long Size = 0, string Hash = "",
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] DesktopLayout? Layout = null);
 public sealed record ClipboardContent(string Format, byte[] Data);
 public sealed record FileOffer(string Id, string Name, long Size);
 public sealed record TransferProgress(string Name, long Completed, long Total, bool Sending);

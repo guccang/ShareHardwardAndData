@@ -7,6 +7,7 @@ internal sealed partial class MainForm
 {
     private const string CardFormat = "SimpleLanShare.InputLayout";
     private readonly WindowsInput inputDesktop = new();
+    private readonly RemotePointerMarker pointerMarker = new();
     private readonly System.Windows.Forms.Timer inputTimer = new() { Interval = 150 };
     private readonly Dictionary<string, PeerSession> inputPeers = [];
     private readonly FlowLayoutPanel inputCards = Flow();
@@ -27,6 +28,7 @@ internal sealed partial class MainForm
         if (!settings.InputOrder.Contains(inputLocalId)) settings.InputOrder.Insert(0, inputLocalId);
         foreach (string id in settings.TrustedDeviceIds)
             if (!settings.InputOrder.Contains(id)) settings.InputOrder.Add(id);
+        if (settings.SharedLayout is {} saved) settings.InputOrder = saved.ForKnownDevices(settings.InputOrder);
         inputRouter = new SharedInput(inputLocalId, inputDesktop, InputNeighbor,
             id => settings.InputAllowed.Contains(id) && settings.TrustedDeviceIds.Contains(id) && !inputDesktop.HasPendingReleases,
             (id, packet) => inputPeers.TryGetValue(id, out var peer) && peer.Input?.TrySend(packet) == true,
@@ -77,6 +79,7 @@ internal sealed partial class MainForm
     // 页面与托盘标出当前控制方向；活动记录不保存按键内容。
     private void UpdateInputStatus(string? reason = null)
     {
+        pointerMarker.SetReceiving(!shuttingDown && inputRouter.Mode == ControlMode.Receiving);
         string name = inputRouter.Peer is {} id ? InputName(id) : "";
         string status = inputRouter.Mode switch
         {
@@ -96,6 +99,11 @@ internal sealed partial class MainForm
     // 所有事件按到达顺序在窗口线程处理，旧连接的回调不能接管已重连的设备。
     private void BindInput(PeerNetwork current, PeerSession peer)
     {
+        peer.LayoutReceived += layout => Ui(() =>
+        {
+            if (network == current && inputPeers.GetValueOrDefault(peer.PeerId) == peer && layout.IsNewerThan(settings.SharedLayout))
+                ApplySharedLayout(layout, peer);
+        });
         if (peer.Input is not {} link) return;
         link.Received = packet =>
         {
@@ -131,6 +139,11 @@ internal sealed partial class MainForm
         inputPeers[peer.PeerId] = peer;
         settings.InputNames[peer.PeerId] = peer.PeerName;
         if (!settings.InputOrder.Contains(peer.PeerId)) settings.InputOrder.Add(peer.PeerId);
+        if (settings.SharedLayout is {} layout)
+        {
+            settings.InputOrder = layout.ForKnownDevices(settings.InputOrder);
+            _ = SendLayoutAsync(peer, layout);
+        }
         RefreshInputCards();
     }
 
@@ -152,9 +165,12 @@ internal sealed partial class MainForm
         enabled.CheckedChanged += (_, _) => { settings.InputEnabled = enabled.Checked; SetInputRuntime(); SaveInputSettings(); };
         var first = Flow(); first.Controls.Add(enabled); page.Controls.Add(first, 0, 0);
         page.Controls.Add(TextLine("电脑排列", 14, true), 0, 1);
-        page.Controls.Add(TextLine("按桌面实际位置左右排列。拖动卡片调整顺序，鼠标推过外侧边缘即可切换。", 10), 0, 2);
+        page.Controls.Add(TextLine("拖动卡片调整左右顺序，排列会自动同步到已配对的电脑。", 10), 0, 2);
         inputCards.AutoScroll = true; page.Controls.Add(inputCards, 0, 3);
         var positions = Flow(); positions.Controls.AddRange([moveLeft, moveRight]);
+        var publish = MakeButton("同步当前排列", width: 125);
+        publish.Click += (_, _) => PublishOrder(settings.InputOrder);
+        positions.Controls.Add(publish);
         moveLeft.Click += (_, _) => MoveInputCard(selectedInputId, settings.InputOrder.IndexOf(selectedInputId) - 1);
         moveRight.Click += (_, _) => MoveInputCard(selectedInputId, settings.InputOrder.IndexOf(selectedInputId) + 1);
         page.Controls.Add(positions, 0, 4);
@@ -224,9 +240,42 @@ internal sealed partial class MainForm
     {
         int old = settings.InputOrder.IndexOf(id);
         if (old < 0 || index < 0 || index >= settings.InputOrder.Count || old == index) return;
-        inputRouter.ReturnLocal("桌面排列已改变");
-        settings.InputOrder.RemoveAt(old); settings.InputOrder.Insert(index, id);
-        selectedInputId = id; SaveInputSettings(); RefreshInputCards();
+        var order = settings.InputOrder.ToList();
+        order.RemoveAt(old); order.Insert(index, id);
+        selectedInputId = id; PublishOrder(order);
+    }
+
+    // 拖动、左右移动和手动发布均产生高于已知版本的新快照。
+    private void PublishOrder(List<string> order)
+    {
+        try { ApplySharedLayout(DesktopLayout.Edit(settings.SharedLayout, inputLocalId, order), null); }
+        catch (InvalidOperationException ex) { inputStatus.Text = ex.Message; }
+    }
+
+    // 先持久化再转发。相同版本不再传播，旧版的本地布局可由用户一次性发布。
+    private void ApplySharedLayout(DesktopLayout layout, PeerSession? source)
+    {
+        var oldLayout = settings.SharedLayout;
+        var oldOrder = settings.InputOrder;
+        settings.SharedLayout = layout;
+        settings.InputOrder = layout.ForKnownDevices(oldOrder);
+        try { if (!smoke) settings.Save(); }
+        catch (Exception ex)
+        {
+            settings.SharedLayout = oldLayout; settings.InputOrder = oldOrder;
+            Log("排列保存失败", ex.Message); inputStatus.Text = "排列保存失败：" + ex.Message; return;
+        }
+        if (!oldOrder.SequenceEqual(settings.InputOrder)) inputRouter.ReturnLocal("桌面排列已改变");
+        RefreshInputCards();
+        foreach (var peer in inputPeers.Values)
+            if (peer != source) _ = SendLayoutAsync(peer, layout);
+    }
+
+    // 失败时保留已保存快照，下一次连接会重新交换最新版本。
+    private async Task SendLayoutAsync(PeerSession peer, DesktopLayout layout)
+    {
+        try { await peer.SendLayoutAsync(layout); }
+        catch (Exception ex) { if (!shuttingDown) Log(peer.PeerName, "排列同步中断：" + ex.Message); }
     }
 
     // 设备权限单独呈现，短指纹可区分同名电脑。

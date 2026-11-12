@@ -22,7 +22,7 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
     private readonly Func<long> now = milliseconds ?? (() => Environment.TickCount64);
     private readonly HashSet<InputPacket> held = [];
     private Guid lease;
-    private int direction, remoteWidth, remoteHeight, x, y, fraction, anchorX, anchorY, homeX, homeY;
+    private int direction, remoteWidth, remoteHeight, x, y, fraction, homeX, homeY;
     private int? edge;
     private long contact, nextPulse, cooldown;
     private bool remoteSelecting, leaveEdge;
@@ -97,7 +97,7 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
             remoteWidth = packet.A; remoteHeight = packet.B;
             x = direction > 0 ? 1 : remoteWidth - 2;
             y = Pixel(fraction, remoteHeight);
-            (anchorX, anchorY) = desktop.Anchor;
+            var (anchorX, anchorY) = desktop.Anchor;
             if (!desktop.Move(anchorX, anchorY)) { ReturnLocal("无法定位光标"); return; }
             Mode = ControlMode.Sending; cooldown = now() + 250;
             Changed?.Invoke("正在控制");
@@ -136,37 +136,39 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
         return true;
     }
 
-    // 本机桌面只在最外缘继续推动时切换；发送时用停驻点到当前鼠标事件的位移驱动远端。
+    // 每个物理位移只应用一次。系统自身的定位事件不作为远端位移累加。
+    public void RemoteMotion(int dx, int dy)
+    {
+        if (Mode != ControlMode.Sending || (dx == 0 && dy == 0)) return;
+        int requestedX = x + dx;
+        y = Math.Clamp(y + dy, 0, remoteHeight - 1);
+        x = Math.Clamp(requestedX, 0, remoteWidth - 1);
+        int side = requestedX < 0 ? -1 : requestedX >= remoteWidth ? 1 : 0;
+        if (side != 0 && held.Count == 0 && !remoteSelecting && now() >= cooldown)
+        {
+            string? next = neighbor(Peer!, side);
+            if (next is not null)
+            {
+                int heightFraction = Fraction(y, remoteHeight);
+                ReturnLocal("切换电脑");
+                if (next == localId)
+                    desktop.Move(side < 0 ? desktop.Width - 2 : 1, Pixel(heightFraction, desktop.Height));
+                else Request(next, side, heightFraction);
+                return;
+            }
+        }
+        if (!send(Peer!, new(InputOp.Move, lease, x, y))) ReturnLocal("键鼠连接已断开");
+    }
+
+    // 本机桌面使用真实屏幕位置判断边缘，等待确认期间仍允许用户取消。
     public bool Pointer(int px, int py)
     {
-        if (!Enabled) return false;
+        if (!Enabled || Mode == ControlMode.Sending) return false;
         if (Mode == ControlMode.Receiving) { ReturnLocal("本机鼠标已接管"); return false; }
         if (Mode == ControlMode.Waiting)
         {
             if (Math.Abs(px - homeX) > 12 || Math.Abs(py - homeY) > 20) ReturnLocal("已取消切换");
             return false;
-        }
-        if (Mode == ControlMode.Sending)
-        {
-            int requestedX = x + px - anchorX;
-            y = Math.Clamp(y + py - anchorY, 0, remoteHeight - 1);
-            x = Math.Clamp(requestedX, 0, remoteWidth - 1);
-            int side = requestedX < 0 ? -1 : requestedX >= remoteWidth ? 1 : 0;
-            if (side != 0 && held.Count == 0 && !remoteSelecting && now() >= cooldown)
-            {
-                string? next = neighbor(Peer!, side);
-                if (next is not null)
-                {
-                    int heightFraction = Fraction(y, remoteHeight);
-                    ReturnLocal("切换电脑");
-                    if (next == localId)
-                        desktop.Move(side < 0 ? desktop.Width - 2 : 1, Pixel(heightFraction, desktop.Height));
-                    else Request(next, side, heightFraction);
-                    return true;
-                }
-            }
-            if (!send(Peer!, new(InputOp.Move, lease, x, y))) ReturnLocal("键鼠连接已断开");
-            return true;
         }
         int boundary = px <= 0 ? -1 : px >= desktop.Width - 1 ? 1 : 0;
         if (boundary == 0) leaveEdge = false;

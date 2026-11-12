@@ -216,6 +216,23 @@ internal static class Program
         var bc = b.Sessions.Single(s => s.PeerId == c.NodeId);
         var cb = c.Sessions.Single(s => s.PeerId == b.NodeId);
         var atB = NextClipboard(ba); var atC = NextClipboard(ca);
+        var layout = DesktopLayout.Edit(null, a.NodeId, [c.NodeId, a.NodeId, b.NodeId]);
+        var atLayoutB = new TaskCompletionSource<DesktopLayout>(TaskCreationOptions.RunContinuationsAsynchronously);
+        ba.LayoutReceived += received => atLayoutB.TrySetResult(received);
+        await ab.SendLayoutAsync(layout);
+        var receivedLayout = await atLayoutB.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var reachedC = new TaskCompletionSource<DesktopLayout>(TaskCreationOptions.RunContinuationsAsynchronously);
+        cb.LayoutReceived += received => reachedC.TrySetResult(received);
+        await bc.SendLayoutAsync(receivedLayout);
+        Check((await reachedC.Task.WaitAsync(TimeSpan.FromSeconds(5))).Order.SequenceEqual(layout.Order), "third paired peer receives relayed arrangement");
+        Check(receivedLayout.Order.SequenceEqual(layout.Order) && receivedLayout.Author == a.NodeId, "layout order survives paired TLS transport");
+        Check(receivedLayout.ForKnownDevices([b.NodeId, a.NodeId, c.NodeId]).SequenceEqual(layout.Order), "paired computers project the same arrangement");
+        Check(receivedLayout.ForKnownDevices([b.NodeId, a.NodeId]).SequenceEqual([a.NodeId, b.NodeId]), "layout cannot pair an unknown device");
+        var next = DesktopLayout.Edit(receivedLayout, b.NodeId, [b.NodeId, a.NodeId]);
+        Check(next.Order.SequenceEqual([c.NodeId, b.NodeId, a.NodeId]) && next.IsNewerThan(layout) && !layout.IsNewerThan(next), "offline member survives an edit and stale revisions are ignored");
+        var concurrent = next with { Author = a.NodeId };
+        Check(next.IsNewerThan(concurrent) != concurrent.IsNewerThan(next) && !next.IsNewerThan(next), "concurrent edits converge without echo");
+        Check(!(next with { Order = [a.NodeId, a.NodeId] }).IsValid(), "duplicate devices cannot form a layout");
         byte[] text = Encoding.UTF8.GetBytes("多电脑剪贴板\r\nHello 🌏");
         await Task.WhenAll(ab.SendClipboardAsync(new("text", text)), ac.SendClipboardAsync(new("text", text)));
         Check((await atB.WaitAsync(TimeSpan.FromSeconds(5))).Data.SequenceEqual(text), "clipboard A to B");
@@ -269,6 +286,11 @@ internal static class Program
         // 中途关闭数据通道，必须清理已创建的临时文件并保留原有完成文件。
         var reAB = a.Sessions.Single(s => s.PeerId == b.NodeId);
         var reBA = b.Sessions.Single(s => s.PeerId == a.NodeId);
+        var caughtUp = new TaskCompletionSource<DesktopLayout>(TaskCreationOptions.RunContinuationsAsynchronously);
+        reAB.LayoutReceived += received => caughtUp.TrySetResult(received);
+        await reBA.SendLayoutAsync(next);
+        var reconnectedLayout = await caughtUp.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Check(reconnectedLayout.IsNewerThan(layout) && reconnectedLayout.Order.SequenceEqual(next.Order), "reconnected peer can adopt the latest persisted layout");
         reBA.Progress += progress => { if (!progress.Sending && progress.Completed == 0) reBA.Close("interrupt after acceptance"); };
         await ThrowsAsync<Exception>(() => reAB.SendFileAsync(source), "disconnect during file stream");
         await UntilAsync(() => !Directory.EnumerateFiles(bDir, "*.partial").Any());

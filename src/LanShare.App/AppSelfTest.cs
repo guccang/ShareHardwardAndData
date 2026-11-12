@@ -26,6 +26,32 @@ internal static class AppSelfTest
             if (input.Width < 1 || input.Height < 1) throw new Exception("Invalid input desktop extent");
         }
         lines.Add("PASS: Windows keyboard and mouse hooks install, release and reinstall without injecting input");
+        var motion = new PointerMotion();
+        for (int n = 0; n < 8; n++)
+        {
+            if (motion.Observe(new Point(-1920, 60), true) != Point.Empty ||
+                motion.Observe(new Point(-1913, 64)) != new Point(7, 4) ||
+                motion.Observe(new Point(960, 540), true) != Point.Empty ||
+                motion.Observe(new Point(957, 546)) != new Point(-3, 6) ||
+                motion.Observe(new Point(957, 546)) != Point.Empty)
+                throw new Exception("Pointer displacement drifted after recenter or re-entry");
+        }
+        lines.Add("PASS: eight round trips exclude warp offsets and stationary motion");
+        Rectangle[] monitors = [new(-1920, 200, 1920, 1080), new(0, 0, 2560, 1440)];
+        if (WindowsInput.VisiblePoint(new Point(-1500, 0), monitors) != new Point(-1500, 200) ||
+            WindowsInput.VisiblePoint(new Point(-120, 400), monitors) != new Point(-120, 400))
+            throw new Exception("Pointer missed visible monitor pixels");
+        lines.Add("PASS: pointer targets visible pixels on staggered monitors with negative origins");
+        using (var marker = new RemotePointerMarker())
+        {
+            marker.SetReceiving(true);
+            var styles = GetWindowLong(marker.Handle, -20);
+            if (!marker.Visible || (styles & 0x08080020) != 0x08080020)
+                throw new Exception("Remote pointer marker must be visible, layered, click-through and non-activating");
+            marker.SetReceiving(false);
+            if (marker.Visible) throw new Exception("Remote pointer marker remained visible after return");
+        }
+        lines.Add("PASS: receiving cursor marker appears click-through and hides on return");
         using var bitmap = new Bitmap(8, 8);
         bitmap.SetPixel(3, 4, Color.FromArgb(128, 20, 100, 200));
         using var memory = new MemoryStream(); bitmap.Save(memory, ImageFormat.Png);
@@ -54,4 +80,8 @@ internal static class AppSelfTest
         lines.AddRange(RecordingInteractionTests.Run(Path.GetDirectoryName(Path.GetFullPath(report))!));
         File.WriteAllLines(report, lines);
     }
+
+    // 从实际窗口句柄读取扩展样式，验证光标标记的点击穿透和不激活行为。
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    private static extern int GetWindowLong(nint window, int index);
 }

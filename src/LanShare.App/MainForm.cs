@@ -375,7 +375,7 @@ internal sealed partial class MainForm : Form
     {
         if (MessageBox.Show(this, "清除已确认的设备并停止共享？下次连接需要重新确认。", "清除信任", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         StopSharing(); settings.TrustedDeviceIds.Clear();
-        settings.InputAllowed.Clear(); settings.InputOrder.Clear(); settings.InputNames.Clear(); RefreshInputCards();
+        settings.InputAllowed.Clear(); settings.InputOrder.Clear(); settings.InputNames.Clear(); settings.SharedLayout = null; RefreshInputCards();
         try { settings.Save(); Log("配对", "已清除信任，点击开启共享可重新配对"); }
         catch (Exception ex) { Log("设置保存失败", ex.Message); }
     }
@@ -592,7 +592,7 @@ internal sealed partial class MainForm : Form
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         recordingTimer.Dispose(); recording.Dispose();
         screenshotHotkey.Dispose(); recordingHotkey.Dispose(); screenshots.Dispose(); StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
-        inputTimer.Dispose(); inputDesktop.Dispose();
+        inputTimer.Dispose(); inputDesktop.Dispose(); pointerMarker.Dispose();
         base.OnFormClosing(e);
     }
 

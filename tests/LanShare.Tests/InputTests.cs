@@ -44,19 +44,29 @@ internal static class InputTests
         check(target.Events.Count == 0, "wrong lease cannot operate remote desktop");
         a.PhysicalEvent(ctrl); a.PhysicalEvent(leftDown); a.PhysicalEvent(new(InputOp.Wheel, default, -120, 1)); Dispatch();
         check(target.Events.Select(p => p.Op).SequenceEqual(new[] { InputOp.Key, InputOp.Button, InputOp.Wheel }), "keys, mouse buttons and wheel stay ordered");
-        clock += 400; a.Pointer(900, 50); Dispatch();
+        clock += 400; a.RemoteMotion(850, 0); Dispatch();
         check(a.Peer == "B" && target.Position.X == 99, "drag at far edge stays on same target");
         a.ReturnLocal("紧急返回"); Dispatch();
         check(target.Events.Count(p => p.Op == InputOp.Key && p.C == 1) == 1 && target.Events.Count(p => p.Op == InputOp.Button && p.B == 0) == 1, "emergency return releases held keys and mouse buttons");
         PushEdge(); Dispatch();
-        target.Selecting = true; clock += 350; b.Tick(); Dispatch(); a.Pointer(900, 50); Dispatch();
+        target.Selecting = true; clock += 350; b.Tick(); Dispatch(); a.RemoteMotion(850, 0); Dispatch();
         check(a.Peer == "B", "remote screenshot selection prevents edge crossing");
-        target.Selecting = false; clock += 350; b.Tick(); Dispatch(); a.Pointer(900, 50); Dispatch();
+        target.Selecting = false; clock += 350; b.Tick(); Dispatch(); a.RemoteMotion(850, 0); Dispatch();
         check(a.Peer == "C" && c.Mode == ControlMode.Receiving && b.Mode == ControlMode.Local, "cross B to C using A peripherals");
-        clock += 350; a.Pointer(0, 50); Dispatch();
+        clock += 350; a.RemoteMotion(-50, 0); Dispatch();
         check(a.Peer == "B" && b.Mode == ControlMode.Receiving, "reverse direction through three computers");
-        clock += 350; a.Pointer(-200, 50); Dispatch();
+        clock += 350; a.RemoteMotion(-250, 0); Dispatch();
         check(a.Mode == ControlMode.Local && desktops["A"].Position.X == 98, "cross adjacent edge back to source");
+        for (int trip = 0; trip < 8; trip++)
+        {
+            PushEdge(); Dispatch();
+            var entry = target.Position;
+            a.RemoteMotion(15, 4); Dispatch();
+            a.RemoteMotion(7, -2); Dispatch();
+            check(a.Mode == ControlMode.Sending && target.Position == (entry.X + 22, entry.Y + 2), "cursor tracks both axes after re-entry " + trip);
+            clock += 350; a.RemoteMotion(-30, 0); Dispatch();
+            check(a.Mode == ControlMode.Local && b.Mode == ControlMode.Local, "reverse edge releases both computers " + trip);
+        }
         PushEdge(); Dispatch();
         a.PhysicalEvent(ctrl); Dispatch();
         check(!b.Pointer(20, 20), "target physical mouse takes local control");

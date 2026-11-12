@@ -13,6 +13,10 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
     private readonly HashSet<InputPacket> pendingReleases = [];
     public bool HasPendingReleases => pendingReleases.Count != 0;
     private Rectangle bounds;
+    private Rectangle[] monitors = [];
+    private readonly PointerMotion motion = new();
+    private SynchronizationContext? ui;
+    private bool centering;
     public SharedInput? Router { get; set; }
     public Keys ReturnKey { get; set; } = Keys.Home;
     public int Width => bounds.Width;
@@ -55,7 +59,10 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
     public void Start()
     {
         bounds = SystemInformation.VirtualScreen;
+        monitors = Screen.AllScreens.Select(s => s.Bounds).ToArray();
         if (mouseHook != 0) return;
+        ui = SynchronizationContext.Current;
+        motion.Observe(Cursor.Position);
         nint module = GetModuleHandle(null);
         try
         {
@@ -109,10 +116,25 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
         if (code >= 0 && Router is {} router)
         {
             var data = Marshal.PtrToStructure<MouseHookData>(pointer);
+            if ((int)message == 0x200)
+            {
+                var point = new Point(data.X, data.Y);
+                var delta = motion.Observe(point, (data.Flags & 1) != 0);
+                // 注入的回中、返回和接收端定位也更新基线，但不转发为物理移动。
+                if ((data.Flags & 1) != 0) return CallNextHookEx(0, code, message, pointer);
+                if (router.Mode == ControlMode.Sending)
+                {
+                    router.RemoteMotion(delta.X, delta.Y);
+                    if (router.Mode != ControlMode.Sending) return 1;
+                    QueueCenterNearEdge(point);
+                    // 让系统提交物理位移，下一事件与上一次实际位置使用同一坐标系。
+                    return CallNextHookEx(0, code, message, pointer);
+                }
+                if (router.Pointer(point.X - bounds.Left, point.Y - bounds.Top)) return 1;
+            }
             if ((data.Flags & 1) == 0)
             {
                 int msg = (int)message;
-                if (msg == 0x200 && router.Pointer(data.X - bounds.Left, data.Y - bounds.Top)) return 1;
                 if (msg is 0x20A or 0x20E && router.PhysicalEvent(new(InputOp.Wheel, default, data.Data >> 16, msg == 0x20E ? 1 : 0))) return 1;
                 int button = msg switch
                 {
@@ -134,10 +156,42 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
         return CallNextHookEx(0, code, message, pointer);
     }
 
-    // 使用绝对虚拟桌面坐标，包含主屏左侧和上方的显示器。
+    // 仅靠近屏幕边缘时在钩子返回后回中，给后续物理移动留出空间。
+    private void QueueCenterNearEdge(Point point)
+    {
+        if (centering || ui == null || monitors.Any(r => Rectangle.Inflate(r, -16, -16).Contains(point))) return;
+        centering = true;
+        ui.Post(_ =>
+        {
+            centering = false;
+            if (Router?.Mode != ControlMode.Sending) return;
+            var (x, y) = Anchor;
+            if (!Move(x, y)) Router.ReturnLocal("无法定位本机光标");
+        }, null);
+    }
+
+    // 将虚拟桌面空隙内的点投影到最近显示器，保证点击落在实际可见像素上。
+    internal static Point VisiblePoint(Point point, Rectangle[] displays)
+    {
+        Point nearest = point;
+        long best = long.MaxValue;
+        foreach (var display in displays)
+        {
+            if (display.Contains(point)) return point;
+            int x = Math.Clamp(point.X, display.Left, display.Right - 1);
+            int y = Math.Clamp(point.Y, display.Top, display.Bottom - 1);
+            long dx = (long)x - point.X, dy = (long)y - point.Y;
+            long distance = dx * dx + dy * dy;
+            if (distance < best) { best = distance; nearest = new Point(x, y); }
+        }
+        return nearest;
+    }
+
+    // 使用各显示器的实际像素和完整虚拟桌面原点进行绝对定位。
     public bool Move(int x, int y)
     {
-        int nx = Normalize(x, Width), ny = Normalize(y, Height);
+        var p = VisiblePoint(new Point(bounds.Left + x, bounds.Top + y), monitors);
+        int nx = Normalize(p.X - bounds.Left, Width), ny = Normalize(p.Y - bounds.Top, Height);
         return SendMouse(0xC001, 0, nx, ny);
     }
 

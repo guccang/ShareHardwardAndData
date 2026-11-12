@@ -21,6 +21,7 @@ public sealed class PeerSession : IDisposable
     public string ReceiveFolder { get; }
     public bool IsConnected => Volatile.Read(ref closed) == 0;
     public event Action<ClipboardContent>? ClipboardReceived;
+    public event Action<DesktopLayout>? LayoutReceived;
     public event Action<string>? FileReceived;
     public event Action<TransferProgress>? Progress;
     public event Action<string>? Closed;
@@ -123,7 +124,17 @@ public sealed class PeerSession : IDisposable
     {
         await controlGate.WaitAsync(ct);
         try { await Wire.SendJsonAsync(control, message, ct); }
+        catch { Close("控制通道写入中断"); throw; }
         finally { controlGate.Release(); }
+    }
+
+    // 使用旧版也能识别的心跳信封，仅在连接和编辑时发送快照。
+    public async Task SendLayoutAsync(DesktopLayout layout)
+    {
+        if (!layout.IsValid()) throw new InvalidDataException("无效的设备排列。");
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stop.Token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        await SendControlAsync(new Message("ping", Layout: layout), timeout.Token);
     }
 
     // 控制通道不包含文件正文，不受大文件传输等待影响。
@@ -133,7 +144,11 @@ public sealed class PeerSession : IDisposable
         {
             var message = await Wire.ReadJsonAsync<Message>(control, stop.Token);
             Interlocked.Exchange(ref lastSeen, Environment.TickCount64);
-            if (message.Kind == "ping") continue;
+            if (message.Kind == "ping")
+            {
+                if (message.Layout is {} layout && layout.IsValid()) LayoutReceived?.Invoke(layout);
+                continue;
+            }
             if (message.Kind == "clipboard")
             {
                 ValidateClipboard(message.Text, message.Size);
