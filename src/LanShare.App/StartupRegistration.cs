@@ -9,7 +9,7 @@ internal static class StartupRegistration
     internal const string ValueName = "SimpleLanShare";
 
     // 自包含程序直接启动 EXE；开发时若使用 dotnet 托管，也完整引用 DLL 路径。
-    internal static string BuildCommand(string executable, string? managedAssembly = null)
+    internal static string BuildLauncher(string executable, string? managedAssembly = null)
     {
         if (!Path.IsPathFullyQualified(executable) || executable.Contains('"')) throw new ArgumentException("启动程序路径无效。");
         string command = "\"" + executable + "\"";
@@ -18,16 +18,22 @@ internal static class StartupRegistration
             if (!Path.IsPathFullyQualified(managedAssembly) || managedAssembly.Contains('"')) throw new ArgumentException("托管程序集路径无效。");
             command += " \"" + managedAssembly + "\"";
         }
-        return command + " --background";
+        return command;
     }
 
+    // 登录启动使用同一启动器，并明确要求后台运行。
+    internal static string BuildCommand(string executable, string? managedAssembly = null) => BuildLauncher(executable, managedAssembly) + " --background";
+
+    // 当前用户启动项使用后台参数。
+    internal static string CurrentCommand() => CurrentLauncher() + " --background";
+
     // 计算当前程序的真实位置，便携程序换目录后重新运行即可更新注册路径。
-    internal static string CurrentCommand()
+    internal static string CurrentLauncher()
     {
         string process = Environment.ProcessPath ?? throw new InvalidOperationException("无法确定程序路径。");
         string? assembly = Path.GetFileNameWithoutExtension(process).Equals("dotnet", StringComparison.OrdinalIgnoreCase)
             ? Path.Combine(AppContext.BaseDirectory, "SimpleLanShare.dll") : null;
-        return BuildCommand(process, assembly);
+        return BuildLauncher(process, assembly);
     }
 
     // 测试可指定隔离子键，生产代码始终使用当前用户 Run 键下唯一的应用值。

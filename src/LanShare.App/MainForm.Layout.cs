@@ -174,6 +174,9 @@ internal sealed partial class MainForm
         var behavior = Flow(); sync.Margin = new Padding(3, 8, 22, 0); accept.Margin = new Padding(3, 8, 3, 0);
         behavior.Controls.AddRange([sync, accept]); page.Controls.Add(behavior, 0, 1);
         var background = Flow(); startup.Margin = new Padding(3, 8, 22, 0); background.Controls.Add(startup);
+        var shellMenu = new CheckBox { Text = "资源管理器右键菜单", Checked = settings.ExplorerMenuEnabled, AutoSize = true, Margin = startup.Margin };
+        shellMenu.Click += (_, _) => ChangeExplorerMenu(shellMenu);
+        background.Controls.Add(shellMenu);
         var shareNow = MakeButton("同步当前剪贴板", width: 150); shareNow.Click += (_, _) => clipboard.ShareNow(); background.Controls.Add(shareNow);
         page.Controls.Add(background, 0, 2);
         page.Controls.Add(TextLine("接收文件", 13, true), 0, 3);

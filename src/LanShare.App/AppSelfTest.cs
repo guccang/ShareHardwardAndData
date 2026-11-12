@@ -117,6 +117,13 @@ internal static class AppSelfTest
         form.SavePreview(Path.ChangeExtension(report, ".png"));
         for (int page = 1; page < 6; page++) form.SavePreview(Path.Combine(Path.GetDirectoryName(report)!, $"page-{page}.png"), page);
         MinimizeTests.Run(form, lines);
+        ExplorerMenuTests.CheckRegistry();
+        lines.Add("PASS: Explorer file submenu and both background verbs register, update and uninstall under an isolated key");
+        var explorerTest = form.TestExplorerSendAsync(Path.GetDirectoryName(Path.GetFullPath(report))!);
+        while (!explorerTest.IsCompleted) { Application.DoEvents(); Thread.Sleep(10); }
+        explorerTest.GetAwaiter().GetResult();
+        lines.Add("PASS: Explorer pipe delivers two files with Unicode and spaces only to the chosen TLS peer while the main window is hidden");
+        form.RestoreWindow();
         form.Close(); Application.DoEvents();
         if (form.IsDisposed || form.Visible) throw new Exception("Close must hide to tray without disposal");
         lines.Add("PASS: window close keeps application alive in tray");

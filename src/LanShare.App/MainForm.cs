@@ -45,8 +45,9 @@ internal sealed partial class MainForm : Form
     private readonly string baseTitle = "局域共享 · Simple LAN Share";
 
     // 正常启动自动发现设备；首次确认前不交换剪贴板或文件。
-    public MainForm(bool smoke = false, bool startInTray = false)
+    public MainForm(bool smoke = false, bool startInTray = false, ExplorerSend? initialSend = null)
     {
+        this.initialSend = initialSend;
         this.smoke = smoke; suppressFirstShow = startInTray;
         settings = smoke ? new AppSettings() : AppSettings.Load();
         identity = settings.ReadIdentity();
@@ -138,7 +139,10 @@ internal sealed partial class MainForm : Form
         if (smoke) return;
         try { StartupRegistration.SetEnabled(settings.LaunchAtLogin, StartupRegistration.CurrentCommand()); settings.Save(); }
         catch (Exception ex) { Log("自启动设置失败", ex.Message); tray.ShowBalloonTip(3000, "自启动设置失败", "可打开窗口重新设置：" + ex.Message, ToolTipIcon.Warning); }
+        ApplyExplorerMenu();
+        _ = ListenForExplorerAsync();
         ToggleSharing();
+        if (initialSend is not null) _ = SendFromExplorerAsync(initialSend);
         if (recordingHotkey.Error is not null) { Log("录屏快捷键", recordingHotkey.Error); recordingMessage.Text = recordingHotkey.Error; tray.ShowBalloonTip(3000, "录屏快捷键未注册", recordingHotkey.Error, ToolTipIcon.Warning); }
         if (screenshotHotkey.Error is not null) { Log("截图快捷键", screenshotHotkey.Error); tray.ShowBalloonTip(3000, "截图快捷键未注册", screenshotHotkey.Error, ToolTipIcon.Warning); }
         else if (!Visible) tray.ShowBalloonTip(2000, "局域共享已在后台运行", screenshotHotkey.Label + " 截图；双击托盘图标打开窗口。", ToolTipIcon.Info);
@@ -332,9 +336,11 @@ internal sealed partial class MainForm : Form
         Ui(() =>
         {
             if (network != current) return;
+            bool menuChanged = !settings.InputNames.TryGetValue(peer.PeerId, out string? name) || name != peer.PeerName || !settings.TrustedDeviceIds.Contains(peer.PeerId);
             settings.TrustedDeviceIds = current.TrustedIds.ToList();
             RememberInputPeer(peer);
             registered.TrySetResult(true);
+            if (settings.ExplorerMenuEnabled && menuChanged) ApplyExplorerMenu();
             try { settings.Save(); } catch (Exception ex) { Log("保存信任失败", ex.Message); }
             RefreshPeers(); Log(peer.PeerName, "已连接并记住此设备，下次自动连接");
         });
@@ -379,6 +385,7 @@ internal sealed partial class MainForm : Form
         if (MessageBox.Show(this, "清除已确认的设备并停止共享？下次连接需要重新确认。", "清除信任", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         StopSharing(); settings.TrustedDeviceIds.Clear();
         settings.InputAllowed.Clear(); settings.InputOrder.Clear(); settings.InputNames.Clear(); settings.SharedLayout = null; RefreshInputCards();
+        if (settings.ExplorerMenuEnabled) ApplyExplorerMenu();
         try { settings.Save(); Log("配对", "已清除信任，点击开启共享可重新配对"); }
         catch (Exception ex) { Log("设置保存失败", ex.Message); }
     }
@@ -428,29 +435,41 @@ internal sealed partial class MainForm : Form
     }
 
     // 拖入时固定目标设备快照；同一批文件分别流式发送到各目标，文件之间保持顺序。
-    private async Task QueueFilesAsync(string[] paths)
+    private async Task QueueFilesAsync(string[] paths, string? explorerPeerId = null)
     {
+        // 资源管理器发起的传输也在托盘提示结果，页面拖放仍沿用活动记录。
+        void Report(string source, string text, bool success = false)
+        {
+            if (shuttingDown) return;
+            Log(source, text);
+            if (explorerPeerId is not null && !smoke)
+                tray.ShowBalloonTip(3500, "局域共享 · 文件发送", text, success ? ToolTipIcon.Info : ToolTipIcon.Warning);
+        }
         var current = network;
-        if (current is null) { Log("提示", "请先开启共享并连接其他电脑"); return; }
-        var selected = targets.SelectedItem as Target;
-        var peers = current.Sessions.Where(p => p.IsConnected && (selected?.Id is null || p.PeerId == selected.Id)).ToArray();
-        if (peers.Length == 0) { Log("提示", "没有在线目标电脑"); return; }
-        if (paths.Length > 128) { Log("提示", "单批最多发送 128 个文件"); return; }
+        if (current is null) { Report("提示", "请先开启共享并连接其他电脑"); return; }
+        string? id = explorerPeerId ?? (targets.SelectedItem as Target)?.Id;
+        var peers = current.Sessions.Where(p => p.IsConnected && (id is null || p.PeerId == id)).ToArray();
+        if (peers.Length == 0) { Report("提示", explorerPeerId is null ? "没有在线目标电脑" : InputName(explorerPeerId) + " 未在线，文件未发送"); return; }
+        if (paths.Length > 128) { Report("提示", "单批最多发送 128 个文件"); return; }
         var files = paths.Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        if (files.Length != paths.Length) Log("提示", "文件夹暂不支持，请先压缩成 ZIP；已跳过目录或不可用项目");
+        if (files.Length != paths.Length) Report("提示", "已跳过目录或不可用的文件；文件夹请先压缩成 ZIP");
         if (files.Length == 0) return;
         Log("发送队列", $"{files.Length} 个文件 → {string.Join("、", peers.Select(p => p.PeerName))}");
         await sends.WaitAsync();
         try
         {
-            if (network != current) return;
+            if (network != current) { Report("提示", "共享连接已更改，已取消发送"); return; }
             await Task.WhenAll(peers.Select(async peer =>
             {
                 foreach (var path in files)
                 {
-                    if (!peer.IsConnected) break;
-                    try { await Task.Run(() => peer.SendFileAsync(path)); Ui(() => Log(peer.PeerName, "发送完成：" + Path.GetFileName(path))); }
-                    catch (Exception ex) { Ui(() => Log(peer.PeerName, "发送失败：" + Path.GetFileName(path) + " · " + ex.Message)); }
+                    if (!peer.IsConnected) { Report(peer.PeerName, peer.PeerName + " 已离线，未发送剩余文件"); break; }
+                    try
+                    {
+                        await Task.Run(() => peer.SendFileAsync(path));
+                        Report(peer.PeerName, "已发送给 " + peer.PeerName + "：" + Path.GetFileName(path), true);
+                    }
+                    catch (Exception ex) { Report(peer.PeerName, "发送失败：" + Path.GetFileName(path) + " · " + ex.Message); }
                 }
             }));
         }
@@ -516,13 +535,17 @@ internal sealed partial class MainForm : Form
     private void ChooseFolder()
     {
         using var dialog = new FolderBrowserDialog { SelectedPath = folder.Text, Description = "选择接收文件的目录", UseDescriptionForTitle = true };
-        if (dialog.ShowDialog(this) == DialogResult.OK) folder.Text = dialog.SelectedPath;
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        string previous = settings.ReceiveFolder;
+        settings.ReceiveFolder = dialog.SelectedPath;
+        try { settings.Save(); folder.Text = settings.ReceiveFolder; }
+        catch (Exception ex) { settings.ReceiveFolder = previous; MessageBox.Show(this, ex.Message, "接收目录保存失败"); }
     }
 
     // 只打开接收目录，不自动执行收到的文件。
     private void OpenFolder()
     {
-        try { Directory.CreateDirectory(folder.Text); Process.Start(new ProcessStartInfo(folder.Text) { UseShellExecute = true }); }
+        try { ExplorerMenu.OpenDirectory(folder.Text); }
         catch (Exception ex) { Log("打开目录失败", ex.Message); }
     }
 
@@ -602,6 +625,7 @@ internal sealed partial class MainForm : Form
         Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
         Microsoft.Win32.SystemEvents.DisplaySettingsChanging -= OnDisplaySettingsChanging;
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+        explorerStop.Cancel();
         recordingTimer.Dispose(); recording.Dispose();
         screenshotHotkey.Dispose(); recordingHotkey.Dispose(); screenshots.Dispose(); StopSharing(); identity.Dispose(); clipboard.Dispose(); tray.Visible = false; tray.Dispose(); appIcon.Dispose();
         input.Dispose();
