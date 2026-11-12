@@ -42,6 +42,20 @@ internal static class InputTests
         check(a.Mode == ControlMode.Sending && b.Mode == ControlMode.Receiving && target.Position.X == 1, "grant activates both ends");
         b.Receive("A", new(InputOp.Button, Guid.NewGuid(), 2, 1));
         check(target.Events.Count == 0, "wrong lease cannot operate remote desktop");
+        foreach (int pressed in new[] { 1, 0, 1, 0 }) a.PhysicalEvent(leftDown with { B = pressed });
+        var letter = new InputPacket(InputOp.Key, default, 65, 30);
+        a.PhysicalEvent(letter); a.PhysicalEvent(letter with { C = 1 }); Dispatch();
+        check(a.Mode == ControlMode.Sending && b.Mode == ControlMode.Receiving && target.Events.Select(p => p.Op).SequenceEqual(
+            new[] { InputOp.Button, InputOp.Button, InputOp.Button, InputOp.Button, InputOp.Key, InputOp.Key }), "double click followed by typing preserves control and ordered down/up");
+        var notices = new List<string>();
+        a.Notice += notices.Add;
+        target.RefuseKey = true; a.PhysicalEvent(letter); Dispatch();
+        target.RefuseKey = false; a.PhysicalEvent(letter with { C = 1 }); Dispatch();
+        check(a.Mode == ControlMode.Sending && b.Mode == ControlMode.Receiving && notices.Count == 1 && target.Events.Count == 6,
+            "denied first key leaves pointer remote and skips orphan release");
+        a.PhysicalEvent(letter); a.PhysicalEvent(letter with { C = 1 }); Dispatch();
+        check(target.Events.Count == 8 && notices.Count == 2, "typing resumes when target accepts input");
+        target.Events.Clear();
         a.PhysicalEvent(ctrl); a.PhysicalEvent(leftDown); a.PhysicalEvent(new(InputOp.Wheel, default, -120, 1)); Dispatch();
         check(target.Events.Select(p => p.Op).SequenceEqual(new[] { InputOp.Key, InputOp.Button, InputOp.Wheel }), "keys, mouse buttons and wheel stay ordered");
         clock += 400; a.RemoteMotion(850, 0); Dispatch();
@@ -69,9 +83,12 @@ internal static class InputTests
         }
         PushEdge(); Dispatch();
         a.PhysicalEvent(ctrl); Dispatch();
+        string? reason = null;
+        a.Changed += text => reason = text;
         check(!b.Pointer(20, 20), "target physical mouse takes local control");
         Dispatch();
         check(a.Mode == ControlMode.Local && b.Mode == ControlMode.Local && target.Events.Last().C == 1, "target takeover releases modifier");
+        check(reason == "对方的实体鼠标已接管", "controller receives remote takeover reason");
         PushEdge(); Dispatch();
         a.PhysicalEvent(leftDown); Dispatch();
         clock += 1900; b.Tick(); packets.Clear(); a.Tick(); packets.Clear();
@@ -112,11 +129,16 @@ internal static class InputTests
         public (int X, int Y) Anchor => (50, 50);
         public bool PhysicalInputHeld { get; set; }
         public bool Selecting { get; set; }
+        public bool RefuseKey { get; set; }
         public (int X, int Y) Position { get; private set; }
         public List<InputPacket> Events { get; } = [];
         // 模拟目标桌面的绝对定位。
         public bool Move(int x, int y) { Position = (x, y); return true; }
         // 保存系统接收的事件，供释放及排序断言使用。
-        public bool Inject(InputPacket packet) { Events.Add(packet); return true; }
+        public bool Inject(InputPacket packet)
+        {
+            if (RefuseKey && packet.Op == InputOp.Key) return false;
+            Events.Add(packet); return true;
+        }
     }
 }

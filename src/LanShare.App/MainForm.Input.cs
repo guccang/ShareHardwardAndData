@@ -44,7 +44,8 @@ internal sealed partial class MainForm
             if (!enabled && !inputDesktop.HasPendingReleases && (network is null || !settings.InputEnabled || inputLocked)) inputTimer.Stop();
             inputRouter.Tick();
         };
-        inputRouter.Changed += reason => Ui(() => UpdateInputStatus(reason));
+        inputRouter.Changed += reason => Ui(() => { UpdateInputStatus(reason); Log("键鼠共享", reason); });
+        inputRouter.Notice += reason => Ui(() => { UpdateInputStatus(); inputStatus.Text += " · " + reason; Log("键盘输入", reason); });
     }
 
     // 只跨到布局中紧邻的在线电脑，离线位置保留，重连后恢复使用。
@@ -105,26 +106,13 @@ internal sealed partial class MainForm
                 ApplySharedLayout(layout, peer);
         });
         if (peer.Input is not {} link) return;
-        link.Received = packet =>
+        var inbox = new DesktopInputQueue(action => BeginInvoke(action), packet =>
         {
-            if (shuttingDown || IsDisposed || !IsHandleCreated) return Task.CompletedTask;
-            var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            try
-            {
-                BeginInvoke(new Action(() =>
-                {
-                    try
-                    {
-                        if (!shuttingDown && network == current && link.IsOpen && inputPeers.GetValueOrDefault(peer.PeerId) == peer)
-                            inputRouter.Receive(peer.PeerId, packet);
-                        done.TrySetResult();
-                    }
-                    catch (Exception ex) { done.TrySetException(ex); }
-                }));
-            }
-            catch (InvalidOperationException) { done.TrySetResult(); }
-            return done.Task;
-        };
+            if (!shuttingDown && network == current && link.IsOpen && inputPeers.GetValueOrDefault(peer.PeerId) == peer)
+                inputRouter.Receive(peer.PeerId, packet);
+        }, link.Dispose);
+        link.Received = inbox.Add;
+        link.Closed += inbox.Dispose;
         link.Closed += () => Ui(() =>
         {
             if (network != current || inputPeers.GetValueOrDefault(peer.PeerId) != peer) return;

@@ -19,6 +19,7 @@ internal static class Program
         {
             await ProtocolTestsAsync();
             InputTests.Run(Check);
+            TestInputQueue();
             await PairingTestsAsync(root);
             await LegacyInputNegotiationAsync(root);
             await ThreePeerTestsAsync(root);
@@ -28,6 +29,28 @@ internal static class Program
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
         finally { Directory.Delete(root, true); }
+    }
+
+    // 模拟界面繁忙期间的高频移动、双击与输入，验证位置合并、事件屏障和背压。
+    private static void TestInputQueue()
+    {
+        var callbacks = new Queue<Action>();
+        var received = new List<InputPacket>();
+        using var inbox = new DesktopInputQueue(callbacks.Enqueue, received.Add, () => throw new Exception("UI dispatch failed"));
+        var lease = Guid.NewGuid();
+        for (int i = 0; i < 1000; i++) inbox.Add(new(InputOp.Move, lease, i, 20));
+        foreach (int down in new[] { 1, 0, 1, 0 }) inbox.Add(new(InputOp.Button, lease, 1, down));
+        inbox.Add(new(InputOp.Move, lease, 40, 40)); inbox.Add(new(InputOp.Key, lease, 65, 30));
+        Check(callbacks.Count == 1, "one UI wakeup for burst of mouse and keyboard input");
+        while (callbacks.TryDequeue(out var callback)) callback();
+        Check(received.Count == 7 && received[0].A == 999 && received[5].A == 40 &&
+            received.Skip(1).Take(4).Select(p => p.B).SequenceEqual([1, 0, 1, 0]) && received[6].Op == InputOp.Key,
+            "latest position arrives before double click and keyboard");
+        Task ready = Task.CompletedTask;
+        for (int i = 0; i < 128; i++) ready = inbox.Add(new(InputOp.Key, lease, 65, 30));
+        Check(!ready.IsCompleted, "full UI queue applies backpressure");
+        while (callbacks.TryDequeue(out var callback)) callback();
+        Check(ready.IsCompletedSuccessfully && received.Count == 135, "drain resumes reader without losing a key");
     }
 
     // 覆盖畸形帧、长度上限、危险文件名及配对码解析。

@@ -17,6 +17,9 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
     private readonly PointerMotion motion = new();
     private SynchronizationContext? ui;
     private bool centering;
+    // 标记本进程重放的事件，从钩子回调中识别自己的输入。
+    internal const uint ReplayTag = 0x534C5348;
+    private LocalDeviceActivity? localActivity;
     public SharedInput? Router { get; set; }
     public Keys ReturnKey { get; set; } = Keys.Home;
     public int Width => bounds.Width;
@@ -70,6 +73,8 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
             if (mouseHook == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
             keyHook = SetWindowsHookEx(13, keyProc, module, 0);
             if (keyHook == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            localActivity = new LocalDeviceActivity(() => Router?.Mode == ControlMode.Receiving,
+                cause => Router?.ReturnLocal(cause == InputEnd.LocalKeyboard ? "本机实体键盘已接管" : "本机实体鼠标已接管", cause));
         }
         catch { Dispose(); throw; }
     }
@@ -80,22 +85,27 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
         if (code >= 0 && Router is {} router)
         {
             var key = Marshal.PtrToStructure<KeyHookData>(data);
-            if ((key.Flags & 0x10) == 0)
+            bool injected = (key.Flags & 0x10) != 0;
+            if (key.Extra != ReplayTag && (!injected || router.Mode == ControlMode.Sending))
             {
                 bool up = (key.Flags & 0x80) != 0;
-                if (!up && router.Mode != ControlMode.Local && key.Vk == (int)ReturnKey && CtrlAltHeld())
+                if (!injected && !up && router.Mode != ControlMode.Local && key.Vk == (int)ReturnKey && CtrlAltHeld())
                 {
                     suppressedKeys.Add(key.Vk);
                     router.ReturnLocal("快捷键返回本机");
                     return 1;
                 }
+                // 被控端依据实体设备报告接管，让输入法和系统派生的键盘通知通过。
+                if (router.Mode == ControlMode.Receiving && localActivity?.Registered == true)
+                    return CallNextHookEx(0, code, message, data);
                 if (router.Mode == ControlMode.Local && suppressedKeys.Contains(key.Vk))
                 {
                     if (up) suppressedKeys.Remove(key.Vk);
                     return 1;
                 }
-                int flags = (up ? 1 : 0) | ((key.Flags & 1) << 1);
-                if (router.PhysicalEvent(new(InputOp.Key, default, key.Vk, key.Scan, flags)))
+                if (!TryMakeKey(key.Vk, key.Scan, key.Flags, out var packet))
+                    return CallNextHookEx(0, code, message, data);
+                if (router.PhysicalEvent(packet))
                 {
                     if (up) suppressedKeys.Remove(key.Vk); else suppressedKeys.Add(key.Vk);
                     return 1;
@@ -104,6 +114,20 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
         }
         return CallNextHookEx(0, code, message, data);
     }
+
+    // 驱动可能提供带 E0/E1 前缀的扫描码，其他未知编码回退到虚拟键。
+    internal static bool TryMakeKey(int vk, int scan, int flags, out InputPacket packet)
+    {
+        packet = default;
+        if (vk is <= 0 or >= 255 or 0xE7) return false;
+        bool extended = (flags & 1) != 0 || (scan & 0xFFFFFF00L) == 0xE000;
+        int code = scan is >= 0 and <= 255 ? scan : (scan & 0xFFFFFF00L) == 0xE000 ? scan & 255 : 0;
+        packet = new(InputOp.Key, default, vk, code, ((flags & 0x80) != 0 ? 1 : 0) | (extended ? 2 : 0));
+        return true;
+    }
+
+    // 按会话切换本机设备监听，发送端只保留原有的钩子。
+    public void SetReceiving(bool receiving) => localActivity?.SetReceiving(receiving);
 
     // 被转发的修饰键没有进入本地异步键状态，需要同时检查已拦截的按下记录。
     private bool CtrlAltHeld() =>
@@ -116,12 +140,16 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
         if (code >= 0 && Router is {} router)
         {
             var data = Marshal.PtrToStructure<MouseHookData>(pointer);
+            bool simulated = data.Extra == ReplayTag || (data.Flags & 1) != 0;
             if ((int)message == 0x200)
             {
                 var point = new Point(data.X, data.Y);
-                var delta = motion.Observe(point, (data.Flags & 1) != 0);
+                var delta = motion.Observe(point, simulated);
+                if (router.Mode == ControlMode.Receiving && !simulated && !delta.IsEmpty)
+                    localActivity?.ObserveLocalMove(data.Time);
                 // 注入的回中、返回和接收端定位也更新基线，但不转发为物理移动。
-                if ((data.Flags & 1) != 0) return CallNextHookEx(0, code, message, pointer);
+                if (simulated || (router.Mode == ControlMode.Receiving && (delta.IsEmpty || localActivity?.Registered == true)))
+                    return CallNextHookEx(0, code, message, pointer);
                 if (router.Mode == ControlMode.Sending)
                 {
                     router.RemoteMotion(delta.X, delta.Y);
@@ -132,9 +160,14 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
                 }
                 if (router.Pointer(point.X - bounds.Left, point.Y - bounds.Top)) return 1;
             }
-            if ((data.Flags & 1) == 0)
+            if (!simulated)
             {
                 int msg = (int)message;
+                if (router.Mode == ControlMode.Receiving && localActivity?.Registered == true)
+                {
+                    if (msg is >= 0x201 and <= 0x20E) localActivity.ObserveLocalMove(data.Time);
+                    return CallNextHookEx(0, code, message, pointer);
+                }
                 if (msg is 0x20A or 0x20E && router.PhysicalEvent(new(InputOp.Wheel, default, data.Data >> 16, msg == 0x20E ? 1 : 0))) return 1;
                 int button = msg switch
                 {
@@ -208,6 +241,7 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
             var input = new NativeInput { Type = 1 };
             input.Payload.Key.Vk = useScan ? (ushort)0 : (ushort)packet.A;
             input.Payload.Key.Scan = (ushort)packet.B;
+            input.Payload.Key.Extra = ReplayTag;
             input.Payload.Key.Flags = (useScan ? 8u : 0u) | ((packet.C & 1) != 0 ? 2u : 0u) | ((packet.C & 2) != 0 ? 1u : 0u);
             return SendInput(1, ref input, Marshal.SizeOf<NativeInput>()) == 1;
         }
@@ -229,13 +263,14 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
     private static bool SendMouse(uint flags, int data, int x = 0, int y = 0)
     {
         var input = new NativeInput();
-        input.Payload.Mouse = new MouseInput { X = x, Y = y, Flags = flags, Data = data };
+        input.Payload.Mouse = new MouseInput { X = x, Y = y, Flags = flags, Data = data, Extra = ReplayTag };
         return SendInput(1, ref input, Marshal.SizeOf<NativeInput>()) == 1;
     }
 
     // 关闭或锁屏后解除钩子并清空短期按下记录。
     public void Dispose()
     {
+        localActivity?.Dispose(); localActivity = null;
         if (keyHook != 0) UnhookWindowsHookEx(keyHook);
         if (mouseHook != 0) UnhookWindowsHookEx(mouseHook);
         keyHook = mouseHook = 0;

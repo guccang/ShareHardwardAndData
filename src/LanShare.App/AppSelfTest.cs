@@ -26,6 +26,24 @@ internal static class AppSelfTest
             if (input.Width < 1 || input.Height < 1) throw new Exception("Invalid input desktop extent");
         }
         lines.Add("PASS: Windows keyboard and mouse hooks install, release and reinstall without injecting input");
+        if (!WindowsInput.TryMakeKey(65, 30, 0, out var letter) || letter.A != 65 || letter.B != 30 || letter.C != 0 ||
+            !WindowsInput.TryMakeKey(0x25, 0xE04B, 0x80, out var left) || left.B != 0x4B || left.C != 3 ||
+            !WindowsInput.TryMakeKey(0x13, 0xE145, 0, out var pause) || pause.B != 0 ||
+            WindowsInput.TryMakeKey(255, 0, 0, out _))
+            throw new Exception("Keyboard scan code normalization failed");
+        lines.Add("PASS: ordinary typing, extended release and virtual-key fallback fit the existing wire format");
+        using (var activity = new LocalDeviceActivity(() => false, _ => { }))
+        {
+            activity.SetReceiving(true);
+            if (!activity.Registered || !LocalDeviceActivity.IsDeviceKeyDown(1, 0, 65, 0) ||
+                LocalDeviceActivity.IsDeviceKeyDown(0, 0, 65, 0) ||
+                LocalDeviceActivity.IsDeviceKeyDown(1, 0, 65, WindowsInput.ReplayTag) ||
+                LocalDeviceActivity.IsDeviceKeyDown(1, 1, 65, 0))
+                throw new Exception("Device takeover filtering failed");
+            activity.SetReceiving(false);
+            if (activity.Registered) throw new Exception("Device subscription retained after return");
+        }
+        lines.Add("PASS: Windows device registration and filtering of replay, release and device-less keyboard events");
         var motion = new PointerMotion();
         for (int n = 0; n < 8; n++)
         {
