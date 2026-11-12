@@ -248,7 +248,7 @@ internal sealed partial class MainForm : Form
     // 同一按钮负责开始与停止；录制期间不自动恢复主窗口以免遮挡选区。
     private async Task ToggleRecordingAsync()
     {
-        if (shuttingDown || screenshots.IsCapturing || shortcutSettingsOpen || recording.IsStopping) return;
+        if (shuttingDown || updateStarted || screenshots.IsCapturing || shortcutSettingsOpen || recording.IsStopping) return;
         if (recording.IsBusy) { await recording.StopAsync(); return; }
         bool restore = Visible;
         if (restore) Hide();
@@ -361,7 +361,7 @@ internal sealed partial class MainForm : Form
             if (network != current) return;
             var item = new ListViewItem([Path.GetFileName(path), peer.PeerName, path]) { Tag = path };
             received.Items.Insert(0, item); Log(peer.PeerName, "已接收：" + Path.GetFileName(path));
-            _ = CheckUpdateAsync(current, peer.PeerId, path);
+            if (UpdatePackage.IsCandidate(path)) _ = CheckUpdatesAsync(current, peer.PeerId, [new(path, null)]);
             if (!Visible) tray.ShowBalloonTip(2500, "收到文件", peer.PeerName + " → " + Path.GetFileName(path), ToolTipIcon.Info);
         });
         peer.Progress += progress => Ui(() => { if (network == current) ShowProgress(peer, progress); });
@@ -489,9 +489,11 @@ internal sealed partial class MainForm : Form
         if (files.Length != paths.Length) Report("提示", "已跳过目录或不可用的文件；文件夹请先压缩成 ZIP");
         if (files.Length == 0) return;
         Log("发送队列", $"{files.Length} 个文件 → {string.Join("、", peers.Select(p => p.PeerName))}");
+        var delivered = new HashSet<UpdateCandidate>();
         await sends.WaitAsync();
         try
         {
+            if (shuttingDown || updateStarted) return;
             if (network != current) { Report("提示", "共享连接已更改，已取消发送"); return; }
             await Task.WhenAll(peers.Select(async peer =>
             {
@@ -500,7 +502,9 @@ internal sealed partial class MainForm : Form
                     if (!peer.IsConnected) { Report(peer.PeerName, peer.PeerName + " 已离线，未发送剩余文件"); break; }
                     try
                     {
-                        await Task.Run(() => peer.SendFileAsync(path));
+                        string digest = await Task.Run(() => peer.SendFileWithReceiptAsync(path));
+                        // 回到界面线程汇总同一批次所有目标的成功回执，同一个包只检查一次。
+                        if (UpdatePackage.IsCandidate(path)) delivered.Add(new(path, digest));
                         Report(peer.PeerName, "已发送给 " + peer.PeerName + "：" + Path.GetFileName(path), true);
                     }
                     catch (Exception ex) { Report(peer.PeerName, "发送失败：" + Path.GetFileName(path) + " · " + ex.Message); }
@@ -508,6 +512,7 @@ internal sealed partial class MainForm : Form
             }));
         }
         finally { sends.Release(); }
+        if (delivered.Count > 0) await CheckUpdatesAsync(current, null, delivered);
     }
 
     // 手动连接作为广播隔离网络的备用入口，错误信息保持可见。

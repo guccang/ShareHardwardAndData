@@ -64,7 +64,10 @@ public sealed class PeerSession : IDisposable
     }
 
     // 文件使用固定大小缓冲流式发送，只有接收方确认后才读取内容。
-    public async Task SendFileAsync(string path, CancellationToken ct = default)
+    public Task SendFileAsync(string path, CancellationToken ct = default) => SendFileWithReceiptAsync(path, ct);
+
+    // 收到对方保存成功的回执后返回实际发送内容的摘要，供发送端核对本机更新包。
+    public async Task<string> SendFileWithReceiptAsync(string path, CancellationToken ct = default)
     {
         string name = Path.GetFileName(path);
         SafeFiles.ValidateName(name);
@@ -97,11 +100,13 @@ public sealed class PeerSession : IDisposable
                 sent += read;
                 if (clock.ElapsedMilliseconds >= 100) { Progress?.Invoke(new(name, sent, size, true)); clock.Restart(); }
             }
-            await Wire.SendJsonAsync(bulk, new Message("end", id, Hash: Convert.ToHexString(hash.GetHashAndReset())), linked.Token);
+            string digest = Convert.ToHexString(hash.GetHashAndReset());
+            await Wire.SendJsonAsync(bulk, new Message("end", id, Hash: digest), linked.Token);
             var result = await completed.Task.WaitAsync(TimeSpan.FromSeconds(60), linked.Token);
             writing = false;
             if (result.Kind != "complete") throw new IOException("接收端未能保存文件：" + result.Text);
             Progress?.Invoke(new(name, size, size, true));
+            return digest;
         }
         catch { if (writing) Close("文件传输中断，请重新连接后重试"); throw; }
         finally

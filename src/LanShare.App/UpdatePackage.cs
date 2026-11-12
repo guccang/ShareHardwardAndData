@@ -31,17 +31,28 @@ internal static class UpdatePackage
         @"\ASimpleLanShare-\d+\.\d+\.\d+-win-x64(?: \(\d+\))?\.zip\z", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     // 在原安装目录的独立子目录中解包；先验证签名，再解压固定成员，不采用 ZIP 内的路径。
-    internal static string? Prepare(string zipPath, string installDir, Version installed)
+    internal static string? Prepare(string zipPath, string installDir, Version installed) =>
+        Prepare(zipPath, installDir, installed, null)?.Directory;
+
+    // 在同一个只读文件句柄上核对发送摘要、验证签名和解包；返回清单中的真实版本。
+    internal static (string Directory, Version Version)? Prepare(string zipPath, string installDir, Version installed, string? sentDigest)
     {
         using var source = File.OpenRead(zipPath);
         if (source.Length > ExeLimit + 2L * GuideLimit) throw new InvalidDataException("更新包过大。");
+        if (sentDigest is not null)
+        {
+            if (!Convert.ToHexString(SHA256.HashData(source)).Equals(sentDigest, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("更新包在发送后已变化。");
+            source.Position = 0;
+        }
         using var zip = new ZipArchive(source, ZipArchiveMode.Read);
         if (zip.Entries.Count != Files.Length || !Files.All(n => zip.GetEntry(n) is not null))
             throw new InvalidDataException("更新包文件列表不完整或含有额外文件。");
         byte[] manifest = ReadEntry(zip.GetEntry(Manifest)!, 8192);
         byte[] signature = ReadEntry(zip.GetEntry(Signature)!, 1024);
         var release = Authenticate(manifest, signature);
-        if (Version.Parse(release.Version) <= installed) return null;
+        var version = Version.Parse(release.Version);
+        if (version <= installed) return null;
 
         string stage = Directory.CreateDirectory(Path.Combine(installDir, StagePrefix + Guid.NewGuid().ToString("N"))).FullName;
         try
@@ -54,7 +65,7 @@ internal static class UpdatePackage
                 CopyEntry(zip.GetEntry(name)!, output, name == Exe ? ExeLimit : GuideLimit);
             }
             VerifyPayload(stage, release);
-            return stage;
+            return (stage, version);
         }
         catch { Cleanup(stage); throw; }
     }

@@ -132,6 +132,7 @@ internal static class AppSelfTest
         while (!explorerTest.IsCompleted) { Application.DoEvents(); Thread.Sleep(10); }
         explorerTest.GetAwaiter().GetResult();
         lines.Add("PASS: Explorer pipe delivers two files with Unicode and spaces only to the chosen TLS peer while the main window is hidden");
+        lines.Add("PASS: sender checks a broadcast update once after delivery and skips a refused update");
         form.RestoreWindow();
         form.Close(); Application.DoEvents();
         if (form.IsDisposed || form.Visible) throw new Exception("Close must hide to tray without disposal");

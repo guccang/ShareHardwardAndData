@@ -20,7 +20,17 @@ internal static class UpdateTests
             UpdatePackage.Prepare(package, root, new Version(999, 0, 0)) is not null)
             throw new Exception("Same/older package was accepted");
         lines.Add("PASS: same-version and downgrade packages leave installation untouched");
-        string stage = UpdatePackage.Prepare(package, root, new Version(0, 0, 0))!;
+        string sentDigest;
+        using (var stream = File.OpenRead(package))
+            sentDigest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream));
+        try
+        {
+            UpdatePackage.Prepare(package, root, new Version(0, 0, 0), new string('0', 64));
+            throw new Exception("Sender accepted a different package at the same path");
+        }
+        catch (InvalidDataException) { }
+        string stage = UpdatePackage.Prepare(package, root, new Version(0, 0, 0), sentDigest)!.Value.Directory;
+        lines.Add("PASS: sender stages the acknowledged signed package and rejects mismatched transfer hashes");
         var signed = UpdatePackage.VerifyStage(stage);
         if (signed.Version != BuildIdentity.Version.ToString() || signed.Commit != BuildIdentity.Commit)
             throw new Exception("Signed metadata differs from running assembly");

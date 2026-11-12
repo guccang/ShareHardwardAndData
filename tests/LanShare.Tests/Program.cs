@@ -269,7 +269,8 @@ internal static class Program
         string source = Path.Combine(root, "文件.bin"); byte[] payload = RandomNumberGenerator.GetBytes(3 * 1024 * 1024 + 27);
         await File.WriteAllBytesAsync(source, payload);
         var bFile = NextFile(ba); var cFile = NextFile(ca);
-        await Task.WhenAll(ab.SendFileAsync(source), ac.SendFileAsync(source));
+        var receipts = await Task.WhenAll(ab.SendFileWithReceiptAsync(source), ac.SendFileWithReceiptAsync(source));
+        Check(receipts.All(value => value == Convert.ToHexString(SHA256.HashData(payload))), "each delivery receipt matches sent file bytes");
         string bPath = await bFile.WaitAsync(TimeSpan.FromSeconds(5)), cPath = await cFile.WaitAsync(TimeSpan.FromSeconds(5));
         Check(SHA256.HashData(await File.ReadAllBytesAsync(bPath)).SequenceEqual(SHA256.HashData(payload)), "streamed file A to B hash");
         Check((await File.ReadAllBytesAsync(cPath)).SequenceEqual(payload), "streamed file A to C hash");

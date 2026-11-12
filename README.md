@@ -1,4 +1,4 @@
-# 局域共享 · Simple LAN Share 0.6.8
+# 局域共享 · Simple LAN Share 0.6.9
 
 在同一局域网的多台 Windows 电脑之间共享一套键盘和鼠标、同步文字和图片剪贴板、拖拽传文件。
 
@@ -25,7 +25,9 @@
 
 ## 从已配对电脑更新
 
-每台电脑先手动安装一次 0.6.6。以后把新版发布包 `SimpleLanShare-版本-win-x64.zip` 像普通文件一样拖给目标电脑，或用资源管理器右键发送。接收完成后，目标电脑验证内置发布公钥的签名、文件哈希、版本和 Git 提交；只有更高版本才会安装。
+接收端从 0.6.6 起支持自动更新。以后把新版发布包 `SimpleLanShare-版本-win-x64.zip` 像普通文件一样拖给目标电脑，或用资源管理器右键发送。接收完成后，目标电脑验证内置发布公钥的签名、文件哈希、版本和 Git 提交；只有更高版本才会安装。
+
+从 0.6.9 起，发送端也会用同一份 ZIP 更新自己。至少一台目标电脑确认保存成功，并且本批所有发送结束后，发送端才检查本机版本。同批发送多个更新包时，选择通过校验的最高版本。
 
 更新会等待当前录屏和本机文件发送结束，在便携版的原目录替换程序并重启到托盘。该目录需要当前用户可写。已配对设备、设置和接收文件继续保留。写入失败或新版启动检查失败时会尝试恢复旧版。主窗口左下角显示实际运行版本及 Git 提交的前 12 位。
 
@@ -127,7 +129,7 @@ Windows 上安装 .NET 8 SDK 或可构建 .NET 8 的更新 SDK：
 .\scripts\build.ps1
 ```
 
-生成 `artifacts\SimpleLanShare-0.6.8-win-x64\SimpleLanShare.exe` 和同名 ZIP。首次构建需要下载微软运行时包，没有第三方 NuGet 依赖。已有缓存时可用 `scripts/build.ps1 -Offline` 离线发布。开发时可直接打开窗口。
+生成 `artifacts\SimpleLanShare-0.6.9-win-x64\SimpleLanShare.exe` 和同名 ZIP。首次构建需要下载微软运行时包，没有第三方 NuGet 依赖。已有缓存时可用 `scripts/build.ps1 -Offline` 离线发布。开发时可直接打开窗口。
 
 ```powershell
 dotnet run --project src\LanShare.App\LanShare.App.csproj -- --show

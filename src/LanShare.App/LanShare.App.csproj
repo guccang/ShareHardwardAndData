@@ -6,7 +6,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>SimpleLanShare</AssemblyName>
-    <Version>0.6.8</Version>
+    <Version>0.6.9</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Product>局域共享</Product>
     <Description>自动配对的局域网剪贴板和文件共享工具</Description>

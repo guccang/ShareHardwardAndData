@@ -84,6 +84,22 @@ internal sealed partial class MainForm
             if (Visible || Directory.GetFiles(other.FullName).Length != 0 ||
                 names.Any(name => File.ReadAllText(Path.Combine(target.FullName, name)) != name))
                 throw new Exception("Explorer transfer did not preserve target, file contents or tray state");
+
+            // 用无效 ZIP 观察真实发送入口触发的校验次数，避免自检安装更新。
+            string archive = Path.Combine(dir, "SimpleLanShare-9.0.0-win-x64.zip");
+            File.WriteAllText(archive, "invalid update");
+            // 仅统计更新日志，普通传输进度不参与断言。
+            int UpdateLogs() => history.Items.Cast<ListViewItem>().Count(row => row.SubItems[1].Text == "软件更新");
+            int before = UpdateLogs();
+            await QueueFilesAsync([archive]);
+            if (UpdateLogs() != before + 1 || !File.Exists(Path.Combine(target.FullName, Path.GetFileName(archive))) ||
+                !File.Exists(Path.Combine(other.FullName, Path.GetFileName(archive))))
+                throw new Exception("Broadcast did not check the sender update exactly once after both deliveries");
+            b.Sessions.Single().ConfirmFileAsync = (_, _) => Task.FromResult(false);
+            await QueueFilesAsync([archive], b.NodeId);
+            if (UpdateLogs() != before + 1) throw new Exception("Refused transfer triggered sender update");
+            await QueueFilesAsync([archive]);
+            if (UpdateLogs() != before + 2) throw new Exception("A refusal suppressed another peer's successful delivery");
         }
         finally
         {
