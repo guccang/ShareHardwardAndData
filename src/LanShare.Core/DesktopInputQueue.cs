@@ -2,7 +2,7 @@ using System.Diagnostics;
 
 namespace LanShare.Core;
 
-// 网络线程有序入队，键鼠线程每次处理一小批；只合并同一会话中连续的绝对位置。
+// 网络线程有序入队，键鼠线程每次处理一小批；合并同一会话中相邻的位置或小幅滚动。
 public sealed class DesktopInputQueue(Action<Action> post, Action<InputPacket> apply, Action failed) : IDisposable
 {
     private readonly LinkedList<InputPacket> items = new();
@@ -16,9 +16,7 @@ public sealed class DesktopInputQueue(Action<Action> post, Action<InputPacket> a
         lock (items)
         {
             if (closed) return Task.CompletedTask;
-            if (packet.Op == InputOp.Move && items.Last is {} tail && tail.Value.Op == InputOp.Move && tail.Value.Lease == packet.Lease)
-                tail.Value = packet;
-            else items.AddLast(packet);
+            if (!packet.TryMergeTail(items.Last)) items.AddLast(packet);
             ready = items.Count >= 128 ? (room ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task : Task.CompletedTask;
             if (scheduled) return ready;
             scheduled = true;

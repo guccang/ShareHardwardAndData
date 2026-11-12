@@ -1,4 +1,4 @@
-# 局域共享 · Simple LAN Share 0.6.9
+# 局域共享 · Simple LAN Share 0.6.10
 
 在同一局域网的多台 Windows 电脑之间共享一套键盘和鼠标、同步文字和图片剪贴板、拖拽传文件。
 
@@ -129,7 +129,7 @@ Windows 上安装 .NET 8 SDK 或可构建 .NET 8 的更新 SDK：
 .\scripts\build.ps1
 ```
 
-生成 `artifacts\SimpleLanShare-0.6.9-win-x64\SimpleLanShare.exe` 和同名 ZIP。首次构建需要下载微软运行时包，没有第三方 NuGet 依赖。已有缓存时可用 `scripts/build.ps1 -Offline` 离线发布。开发时可直接打开窗口。
+生成 `artifacts\SimpleLanShare-0.6.10-win-x64\SimpleLanShare.exe` 和同名 ZIP。首次构建需要下载微软运行时包，没有第三方 NuGet 依赖。已有缓存时可用 `scripts/build.ps1 -Offline` 离线发布。开发时可直接打开窗口。
 
 ```powershell
 dotnet run --project src\LanShare.App\LanShare.App.csproj -- --show

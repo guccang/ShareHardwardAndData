@@ -20,6 +20,7 @@ internal static class Program
             await ProtocolTestsAsync();
             InputTests.Run(Check);
             TestInputQueue();
+            TestWheelBurst();
             await PairingTestsAsync(root);
             await LegacyInputNegotiationAsync(root);
             await ThreePeerTestsAsync(root);
@@ -51,6 +52,33 @@ internal static class Program
         Check(!ready.IsCompleted, "full UI queue applies backpressure");
         while (callbacks.TryDequeue(out var callback)) callback();
         Check(ready.IsCompletedSuccessfully && received.Count == 135, "drain resumes reader without losing a key");
+    }
+
+    // 模拟输入线程短暂繁忙后收到的连续小幅滚动，检查滚动量、方向和操作边界。
+    private static void TestWheelBurst()
+    {
+        var callbacks = new Queue<Action>();
+        var received = new List<InputPacket>();
+        using var inbox = new DesktopInputQueue(callbacks.Enqueue, received.Add, () => throw new Exception("Wheel dispatch failed"));
+        using var sender = new InputLink(Stream.Null);
+        var tiny = new InputPacket(InputOp.Wheel, Guid.NewGuid(), -1);
+        for (int i = 0; i < 967; i++)
+        {
+            if (!sender.TrySend(tiny)) throw new Exception("Fine wheel input filled the sender queue");
+            if (!inbox.Add(tiny).IsCompletedSuccessfully) throw new Exception("Fine wheel input stalled the receiver");
+        }
+        InputPacket[] barriers = [tiny with { A = 3 }, tiny with { A = 6, B = 1 },
+            tiny with { A = 6, B = 1, Lease = Guid.NewGuid() }, new(InputOp.Key, tiny.Lease, 17, 29),
+            tiny, new(InputOp.Move, tiny.Lease, 40, 50), tiny, new(InputOp.Button, tiny.Lease, 1, 1),
+            tiny, tiny with { A = -120 }, tiny with { A = -120 }];
+        foreach (var packet in barriers) inbox.Add(packet);
+        while (callbacks.TryDequeue(out var callback)) callback();
+        var expected = Enumerable.Repeat(tiny with { A = -120 }, 8).Append(tiny with { A = -7 }).Concat(barriers);
+        Check(received.SequenceEqual(expected), "967 fine wheel deltas drain in 9 events with exact distance, barriers and detents preserved");
+        received.Clear();
+        inbox.Add(tiny);
+        while (callbacks.TryDequeue(out var callback)) callback();
+        Check(received.SequenceEqual([tiny]), "a single partial wheel delta is dispatched without waiting for another");
     }
 
     // 覆盖畸形帧、长度上限、危险文件名及配对码解析。
@@ -117,6 +145,22 @@ internal static class Program
         restoredB.Sessions.Single().Input!.Received = packet => { inputEvent.TrySetResult(packet); return Task.CompletedTask; };
         var wheel = new InputPacket(InputOp.Wheel, Guid.NewGuid(), -120, 1);
         Check(inputSender.TrySend(wheel) && await inputEvent.Task.WaitAsync(TimeSpan.FromSeconds(5)) == wheel, "independent certificate-bound input stream roundtrip");
+
+        // 通过真实 TLS 连续发送超过一个写批次的整刻度，核对解帧顺序及队列末尾的按键。
+        var burst = Enumerable.Range(0, 96).Select(i => wheel with { A = i % 2 == 0 ? 120 : -120, B = i % 3 == 0 ? 1 : 0 })
+            .Append(new(InputOp.Key, wheel.Lease, 17, 29)).ToArray();
+        var delivered = new List<InputPacket>();
+        var finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        restoredB.Sessions.Single().Input!.Received = packet =>
+        {
+            delivered.Add(packet);
+            if (delivered.Count == burst.Length) finished.SetResult();
+            return Task.CompletedTask;
+        };
+        foreach (var packet in burst)
+            if (!inputSender.TrySend(packet)) throw new Exception("Wheel burst could not be queued");
+        await finished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Check(delivered.SequenceEqual(burst), "real TLS delivers full detents across batches and the following key in order");
 
         using var strangerIdentity = Security.CreateCertificate();
         using var stranger = new PeerNetwork(strangerIdentity, root, port: FreePort());

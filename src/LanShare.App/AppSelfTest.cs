@@ -60,6 +60,13 @@ internal static class AppSelfTest
             if (activity.Registered) throw new Exception("Device subscription retained after return");
         }
         lines.Add("PASS: Windows device registration and filtering of replay, release and device-less keyboard events");
+        if (!WindowsInput.CanRouteWheel(ControlMode.Sending, 0, 0) ||
+            !WindowsInput.CanRouteWheel(ControlMode.Sending, 1, 0) ||
+            WindowsInput.CanRouteWheel(ControlMode.Receiving, 1, 0) ||
+            WindowsInput.CanRouteWheel(ControlMode.Sending, 3, 0) ||
+            WindowsInput.CanRouteWheel(ControlMode.Sending, 1, WindowsInput.ReplayTag))
+            throw new Exception("Smooth wheel hook filtering failed");
+        lines.Add("PASS: smooth wheel driver events route only while sending, excluding replay and lower-integrity input");
         var motion = new PointerMotion();
         for (int n = 0; n < 8; n++)
         {

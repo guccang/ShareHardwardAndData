@@ -24,6 +24,19 @@ public readonly record struct InputPacket(InputOp Op, Guid Lease, int A = 0, int
         _ => false
     };
 
+    // 合并仍在队尾的相邻输入。小幅滚动最多合到单个刻度，保留余量、反转和横纵切换。
+    internal bool TryMergeTail(LinkedListNode<InputPacket>? tail)
+    {
+        if (tail is null || tail.Value.Lease != Lease || tail.Value.Op != Op) return false;
+        var previous = tail.Value;
+        if (Op == InputOp.Move) { tail.Value = this; return true; }
+        if (Op != InputOp.Wheel || B != previous.B || A == 0 || Math.Sign(A) != Math.Sign(previous.A)) return false;
+        long delta = (long)previous.A + A;
+        if (delta is < -120 or > 120) return false;
+        tail.Value = this with { A = (int)delta };
+        return true;
+    }
+
     // 同一缓冲反复使用，避免鼠标移动时为每一帧分配 JSON。
     internal void Encode(Span<byte> bytes)
     {
@@ -47,27 +60,23 @@ public readonly record struct InputPacket(InputOp Op, Guid Lease, int A = 0, int
 public sealed class InputLink(Stream stream) : IDisposable
 {
     private readonly LinkedList<InputPacket> queue = new();
-    private readonly SemaphoreSlim available = new(0);
+    private readonly SemaphoreSlim available = new(0, 1);
     private readonly CancellationTokenSource stop = new();
     private int closed;
     public bool IsOpen => Volatile.Read(ref closed) == 0;
     public Func<InputPacket, Task>? Received { get; set; }
     public event Action? Closed;
 
-    // 只合并相邻的绝对位置，按钮、滚轮和键盘事件始终保持原来的先后顺序。
+    // 队列从空变为非空时立即唤醒写线程；连续小幅滚动只合并尚未发送的部分。
     public bool TrySend(InputPacket packet)
     {
         lock (queue)
         {
             if (!IsOpen || !packet.Valid) return false;
-            if (packet.Op == InputOp.Move && queue.Last is {} last && last.Value.Op == InputOp.Move && last.Value.Lease == packet.Lease)
-            {
-                last.Value = packet;
-                return true;
-            }
+            if (packet.TryMergeTail(queue.Last)) return true;
             if (queue.Count >= 256) { _ = Task.Run(Dispose); return false; }
             queue.AddLast(packet);
-            available.Release();
+            if (queue.Count == 1) available.Release();
             return true;
         }
     }
@@ -91,19 +100,26 @@ public sealed class InputLink(Stream stream) : IDisposable
         });
         _ = Task.Run(async () =>
         {
-            byte[] buffer = new byte[InputPacket.Length];
+            // 使用原有定长帧，只将已经就绪的输入一起写入 TLS，不等待凑批。
+            byte[] buffer = new byte[32 * InputPacket.Length];
             try
             {
                 while (IsOpen)
                 {
                     await available.WaitAsync(stop.Token);
+                    int bytes = 0;
                     lock (queue)
                     {
                         if (!IsOpen) return;
-                        queue.First!.Value.Encode(buffer);
-                        queue.RemoveFirst();
+                        while (queue.First is { } first && bytes < buffer.Length)
+                        {
+                            first.Value.Encode(buffer.AsSpan(bytes, InputPacket.Length));
+                            bytes += InputPacket.Length;
+                            queue.RemoveFirst();
+                        }
+                        if (queue.Count != 0) available.Release();
                     }
-                    await stream.WriteAsync(buffer, stop.Token);
+                    await stream.WriteAsync(buffer.AsMemory(0, bytes), stop.Token);
                 }
             }
             catch (Exception) { Dispose(); }

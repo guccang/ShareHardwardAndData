@@ -143,6 +143,10 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
         (suppressedKeys.Contains(0xA2) || suppressedKeys.Contains(0xA3) || GetAsyncKeyState(0x11) < 0) &&
         (suppressedKeys.Contains(0xA4) || suppressedKeys.Contains(0xA5) || GetAsyncKeyState(0x12) < 0);
 
+    // 主控时也接受同级或更高权限驱动注入的滚轮，过滤低权限注入和本程序回放。
+    internal static bool CanRouteWheel(ControlMode mode, int flags, nuint extra) =>
+        extra != ReplayTag && (flags & 2) == 0 && ((flags & 1) == 0 || mode == ControlMode.Sending);
+
     // 区分物理移动、五种鼠标按钮及两个滚轮方向；系统注入的移动不会再被转发。
     private nint Mouse(int code, nint message, nint pointer)
     {
@@ -169,15 +173,19 @@ internal sealed class WindowsInput : IInputDesktop, IDisposable
                 }
                 if (router.Pointer(point.X - bounds.Left, point.Y - bounds.Top)) return 1;
             }
-            if (!simulated)
+            int msg = (int)message;
+            if (!simulated && router.Mode == ControlMode.Receiving && localActivity?.Registered == true)
             {
-                int msg = (int)message;
-                if (router.Mode == ControlMode.Receiving && localActivity?.Registered == true)
-                {
-                    if (msg is >= 0x201 and <= 0x20E) localActivity.ObserveLocalMove(data.Time);
-                    return CallNextHookEx(0, code, message, pointer);
-                }
-                if (msg is 0x20A or 0x20E && router.PhysicalEvent(new(InputOp.Wheel, default, data.Data >> 16, msg == 0x20E ? 1 : 0))) return 1;
+                if (msg is >= 0x201 and <= 0x20E) localActivity.ObserveLocalMove(data.Time);
+                return CallNextHookEx(0, code, message, pointer);
+            }
+            if (msg is 0x20A or 0x20E)
+            {
+                if (CanRouteWheel(router.Mode, data.Flags, data.Extra) &&
+                    router.PhysicalEvent(new(InputOp.Wheel, default, data.Data >> 16, msg == 0x20E ? 1 : 0))) return 1;
+            }
+            else if (!simulated)
+            {
                 int button = msg switch
                 {
                     0x201 or 0x202 => 1, 0x204 or 0x205 => 2, 0x207 or 0x208 => 3,
