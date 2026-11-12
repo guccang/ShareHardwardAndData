@@ -172,6 +172,8 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
             Remember(packet);
             if (packet.Op == InputOp.Key) SetKeyboardBlocked(false);
         }
+        // 活跃接收端按照同一心跳间隔报告进度，即使持续输入令定时回调延后。
+        if (Mode == ControlMode.Receiving) SendPulseIfDue(now());
     }
 
     // 输入失败时重新检查焦点，保留其他鼠标失败的原有原因。
@@ -273,7 +275,13 @@ public sealed class SharedInput(string localId, IInputDesktop desktop, Func<stri
         if (Mode == ControlMode.Local) return;
         long time = now();
         if (time - contact >= 1800) { ReturnLocal("键鼠连接超时，已返回本机", InputEnd.Timeout); return; }
-        if (Mode == ControlMode.Waiting || time < nextPulse) return;
+        if (Mode != ControlMode.Waiting) SendPulseIfDue(time);
+    }
+
+    // 滚动与定时检查共用发送期限，连续输入不增加心跳频率。
+    private void SendPulseIfDue(long time)
+    {
+        if (time < nextPulse) return;
         if (Mode == ControlMode.Receiving && desktop.ForegroundHasHigherIntegrity)
         {
             ReturnLocal(LocalPrivilegeReason, InputEnd.HigherIntegrity);

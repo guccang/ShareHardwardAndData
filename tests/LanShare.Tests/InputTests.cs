@@ -12,6 +12,7 @@ internal static class InputTests
         var allowed = new HashSet<(string Target, string Source)>();
         var packets = new Queue<(string From, string To, InputPacket Event)>();
         long clock = 1000;
+        int scrollPulses = 0;
         foreach (var id in ids)
         {
             routers[id] = new(id, desktops[id], Neighbor, source => allowed.Contains((id, source)),
@@ -112,6 +113,19 @@ internal static class InputTests
         a.PhysicalEvent(leftDown); a.PhysicalEvent(leftDown with { B = 0 }); Dispatch();
         check(a.Mode == ControlMode.Sending && b.Mode == ControlMode.Receiving && target.Events.Count == eventCount + 2,
             "matching integrity permits re-entry and clicks without re-pairing");
+        // 接收端持续处理滚轮，刻意不分派其定时器；主控端照常执行断线检查。
+        int receivedBeforeScroll = target.Events.Count;
+        scrollPulses = 0;
+        for (int i = 0; i < 2400; i++)
+        {
+            clock += 2;
+            a.PhysicalEvent(new(InputOp.Wheel, default, i % 2 == 0 ? 120 : -120));
+            Dispatch();
+            if (i % 75 == 0) { a.Tick(); Dispatch(); }
+        }
+        check(a.Mode == ControlMode.Sending && b.Mode == ControlMode.Receiving &&
+            target.Events.Count == receivedBeforeScroll + 2400, "4.8s of wheel traffic without receiver timer dispatch keeps both ends active");
+        check(scrollPulses is >= 15 and <= 17, "busy receiver returns rate-limited heartbeats instead of one per wheel");
         a.ReturnLocal("测试结束"); Dispatch();
         PushEdge(); Dispatch();
         a.PhysicalEvent(leftDown); Dispatch();
@@ -146,7 +160,11 @@ internal static class InputTests
         // 按写入顺序递送到各个独立状态机，包括接收端的确认和结束响应。
         void Dispatch()
         {
-            while (packets.TryDequeue(out var p)) routers[p.To].Receive(p.From, p.Event);
+            while (packets.TryDequeue(out var p))
+            {
+                if (p.From == "B" && p.Event.Op == InputOp.Pulse) scrollPulses++;
+                routers[p.To].Receive(p.From, p.Event);
+            }
         }
     }
 

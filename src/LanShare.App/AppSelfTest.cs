@@ -40,6 +40,8 @@ internal static class AppSelfTest
                 catch (Exception ex) { tested.SetException(ex); }
             });
             tested.Task.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+            CheckBusyClock(loop);
+            lines.Add("PASS: periodic heartbeat runs on the input thread while desktop work remains queued");
         }
         lines.Add("PASS: dedicated input thread installs, releases and reinstalls both Windows hooks while UI waits");
         if (!WindowsInput.TryMakeKey(65, 30, 0, out var letter) || letter.A != 65 || letter.B != 30 || letter.C != 0 ||
@@ -167,4 +169,36 @@ internal static class AppSelfTest
     [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern nint GetCursor();
     // 等待桌面合成器完成显示后再验证命中位置。
     [System.Runtime.InteropServices.DllImport("dwmapi.dll")] private static extern int DwmFlush();
+    // 持续排入桌面工作使消息队列无法空闲，验证心跳仍能在同一线程得到调度。
+    private static void CheckBusyClock(InputMessageLoop loop)
+    {
+        var finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        loop.Post(() =>
+        {
+            int owner = Environment.CurrentManagedThreadId;
+            int beats = 0;
+            long deadline = Environment.TickCount64 + 3000;
+            loop.SetClock(() =>
+            {
+                if (Environment.CurrentManagedThreadId != owner) finished.TrySetException(new Exception("Unexpected heartbeat thread"));
+                beats++;
+            });
+            // 模拟接收队列每处理完一小批，就立刻投递下一批。
+            void Drain()
+            {
+                if (beats >= 3 || Environment.TickCount64 >= deadline || finished.Task.IsCompleted)
+                {
+                    loop.SetClock(null);
+                    if (beats >= 3) finished.TrySetResult();
+                    else finished.TrySetException(new Exception("Queued desktop input starved the heartbeat"));
+                    return;
+                }
+                Thread.Sleep(2);
+                loop.Post(Drain);
+            }
+            Drain();
+        });
+        finished.Task.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+    }
+
 }

@@ -10,7 +10,6 @@ internal sealed class InputRuntime : IDisposable
     private readonly WindowsInput desktop = new();
     private readonly SharedInput router;
     private readonly string localId;
-    private readonly System.Windows.Forms.Timer timer = new() { Interval = 150 };
     private RemotePointerMarker? marker;
     private string[] order = [];
     private HashSet<string> allowed = [];
@@ -27,7 +26,6 @@ internal sealed class InputRuntime : IDisposable
         router = new(localId, desktop, Neighbor, id => allowed.Contains(id) && !desktop.HasPendingReleases,
             (id, packet) => peers.TryGetValue(id, out var peer) && peer.Input?.TrySend(packet) == true, selecting);
         desktop.Router = router;
-        timer.Tick += (_, _) => Tick();
         router.Changed += reason => Publish(reason);
         router.Notice += reason => Publish(reason, notice: true);
     }
@@ -67,16 +65,16 @@ internal sealed class InputRuntime : IDisposable
         running = enabled;
         if (enabled)
         {
-            try { desktop.Start(); router.Enable(WindowsInput.OnUserDesktop()); timer.Start(); }
+            try { desktop.Start(); router.Enable(WindowsInput.OnUserDesktop()); loop.SetClock(Tick); }
             catch (Exception ex)
             {
                 running = false; router.Enable(false); desktop.Dispose();
-                timer.Enabled = desktop.HasPendingReleases; Publish(ex.Message); return;
+                loop.SetClock(desktop.HasPendingReleases ? Tick : null); Publish(ex.Message); return;
             }
         }
         else
         {
-            router.Enable(false); desktop.Dispose(); timer.Enabled = desktop.HasPendingReleases;
+            router.Enable(false); desktop.Dispose(); loop.SetClock(desktop.HasPendingReleases ? Tick : null);
         }
         Publish();
     });
@@ -88,7 +86,7 @@ internal sealed class InputRuntime : IDisposable
         if (active && desktop.HasPendingReleases && !desktop.ForegroundHasHigherIntegrity) desktop.RetryReleases();
         bool enabled = running && active;
         if (router.Enabled != enabled) { router.Enable(enabled); Publish(); }
-        if (!running && !desktop.HasPendingReleases) timer.Stop();
+        if (!running && !desktop.HasPendingReleases) loop.SetClock(null);
         router.Tick();
     }
 
@@ -141,7 +139,7 @@ internal sealed class InputRuntime : IDisposable
     {
         loop.Post(() =>
         {
-            router.Enable(false); timer.Dispose(); desktop.Dispose(); marker?.Dispose(); marker = null;
+            loop.SetClock(null); router.Enable(false); desktop.Dispose(); marker?.Dispose(); marker = null;
         });
         loop.Dispose();
     }
